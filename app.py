@@ -3,6 +3,7 @@ import pandas as pd
 import yfinance as yf
 from io import BytesIO
 from datetime import datetime, timedelta
+import time
 
 st.set_page_config(
     page_title="Bhavcopy – NSE Close Prices",
@@ -126,23 +127,13 @@ def to_yf_ticker(symbol):
     return symbol.strip().upper() + ".NS"
 
 # ── FETCH PRICES ─────────────────────────────────────────────
-def fetch_prices(symbols, date_objects):
-    min_date = min(date_objects)
-    max_date = max(date_objects)
+MAX_RETRIES   = 3          # retry each symbol up to 3 times
+RETRY_DELAY   = 4          # seconds to wait between retries
+REQUEST_DELAY = 0.5        # seconds between each symbol fetch (avoids rate-limiting)
 
-    fetch_start = (min_date - timedelta(days=7)).strftime("%Y-%m-%d")
-    fetch_end   = (max_date + timedelta(days=8)).strftime("%Y-%m-%d")
-
-    results = {}
-    failed  = []
-
-    progress = st.progress(0, text="Starting…")
-    total = len(symbols)
-
-    for i, symbol in enumerate(symbols):
-        progress.progress(int(i / total * 100), text=f"Fetching {symbol}  ({i+1} of {total})")
-        ticker = to_yf_ticker(symbol)
-
+def fetch_single(ticker, fetch_start, fetch_end):
+    """Download data for one ticker with retries. Returns DataFrame or raises."""
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
             df = yf.download(
                 ticker,
@@ -153,10 +144,44 @@ def fetch_prices(symbols, date_objects):
                 auto_adjust=False,
                 actions=False,
             )
+            if not df.empty:
+                return df          # success
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+        except Exception as e:
+            if attempt < MAX_RETRIES:
+                time.sleep(RETRY_DELAY)
+            else:
+                raise e
+    return pd.DataFrame()          # all retries exhausted → empty
+
+
+def fetch_prices(symbols, date_objects):
+    min_date = min(date_objects)
+    max_date = max(date_objects)
+
+    fetch_start = (min_date - timedelta(days=7)).strftime("%Y-%m-%d")
+    fetch_end   = (max_date + timedelta(days=8)).strftime("%Y-%m-%d")
+
+    results      = {}
+    failed       = []
+    failed_errors = {}   # symbol → error reason for display
+
+    progress = st.progress(0, text="Starting…")
+    total = len(symbols)
+
+    for i, symbol in enumerate(symbols):
+        progress.progress(int(i / total * 100), text=f"Fetching {symbol}  ({i+1} of {total})")
+        ticker = to_yf_ticker(symbol)
+
+        try:
+            df = fetch_single(ticker, fetch_start, fetch_end)
 
             if df.empty:
                 failed.append(symbol)
+                failed_errors[symbol] = "No data returned (check NSE ticker or date range)"
                 results[symbol] = {}
+                time.sleep(REQUEST_DELAY)
                 continue
 
             if isinstance(df.columns, pd.MultiIndex):
@@ -174,12 +199,15 @@ def fetch_prices(symbols, date_objects):
 
             results[symbol] = close_map
 
-        except Exception:
+        except Exception as e:
             failed.append(symbol)
+            failed_errors[symbol] = str(e)[:120]
             results[symbol] = {}
 
+        time.sleep(REQUEST_DELAY)   # polite delay between each symbol
+
     progress.progress(100, text="Done!")
-    return results, failed
+    return results, failed, failed_errors
 
 # ── BUILD OUTPUT ─────────────────────────────────────────────
 def build_output(symbols, dates_with_labels, price_data):
@@ -271,7 +299,7 @@ if raw_input.strip():
         st.markdown("---")
 
         if st.button("🔄 Fetch Closing Prices", type="primary", use_container_width=True):
-            price_data, failed = fetch_prices(symbols, date_objects)
+            price_data, failed, failed_errors = fetch_prices(symbols, date_objects)
             output_df = build_output(symbols, dates_with_labels, price_data)
 
             total_cells  = len(symbols) * len(dates_with_labels)
@@ -287,7 +315,10 @@ if raw_input.strip():
             """, unsafe_allow_html=True)
 
             if failed:
-                st.markdown(f'<div class="warn-box">⚠️ Failed symbols (check NSE ticker): <strong>{", ".join(failed)}</strong></div>', unsafe_allow_html=True)
+                failed_details = " &nbsp;|&nbsp; ".join(
+                    f"<strong>{s}</strong>: {failed_errors.get(s, 'unknown error')}" for s in failed
+                )
+                st.markdown(f'<div class="warn-box">⚠️ Failed symbols — {failed_details}</div>', unsafe_allow_html=True)
 
             # Preview — cap at 15 date columns for display
             st.markdown("### Preview")
