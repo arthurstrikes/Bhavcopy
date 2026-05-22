@@ -122,14 +122,37 @@ def parse_input(raw):
 
     return symbols, dates, unparsed
 
-# ── YAHOO FINANCE TICKER ─────────────────────────────────────
+# ── TICKER ALIAS MAP ─────────────────────────────────────────
+# Maps common shorthand / alternate names → correct Yahoo Finance NSE ticker
+# Add new entries here as you discover mismatches
+TICKER_ALIASES = {
+    # GMDC is the common name; Yahoo Finance uses the full registered ticker
+    "GMDC":         "GMDCLTD",
+    # Common shorthand variations
+    "LT":           "LT",
+    "M&M":          "M&M",
+    "MM":           "M&M",
+    "BAJAJ AUTO":   "BAJAJ-AUTO",
+    "BAJAJ_AUTO":   "BAJAJ-AUTO",
+    # NMDC Steel subsidiary (different from parent NMDC)
+    "NMDCSTEEL":    "NSLNISP",
+    # Motherson Sumi rebranded
+    "MOTHERSUMI":   "MOTHERSON",
+    # Occasionally mistyped
+    "LTIM":         "LTIM",
+    "LTIMINDTREE":  "LTIM",
+    "HINDZINC":     "HINDZINC",
+}
+
 def to_yf_ticker(symbol):
-    return symbol.strip().upper() + ".NS"
+    symbol = symbol.strip().upper()
+    symbol = TICKER_ALIASES.get(symbol, symbol)   # apply alias if exists
+    return symbol + ".NS"
 
 # ── FETCH PRICES ─────────────────────────────────────────────
-MAX_RETRIES   = 3          # retry each symbol up to 3 times
-RETRY_DELAY   = 4          # seconds to wait between retries
-REQUEST_DELAY = 0.5        # seconds between each symbol fetch (avoids rate-limiting)
+MAX_RETRIES   = 3      # retry each symbol up to 3 times on failure
+RETRY_DELAY   = 4      # seconds to wait between retries
+REQUEST_DELAY = 0.5    # seconds between each symbol (avoids rate-limiting)
 
 def fetch_single(ticker, fetch_start, fetch_end):
     """Download data for one ticker with retries. Returns DataFrame or raises."""
@@ -145,7 +168,7 @@ def fetch_single(ticker, fetch_start, fetch_end):
                 actions=False,
             )
             if not df.empty:
-                return df          # success
+                return df
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
         except Exception as e:
@@ -153,7 +176,7 @@ def fetch_single(ticker, fetch_start, fetch_end):
                 time.sleep(RETRY_DELAY)
             else:
                 raise e
-    return pd.DataFrame()          # all retries exhausted → empty
+    return pd.DataFrame()   # all retries exhausted
 
 
 def fetch_prices(symbols, date_objects):
@@ -163,9 +186,9 @@ def fetch_prices(symbols, date_objects):
     fetch_start = (min_date - timedelta(days=7)).strftime("%Y-%m-%d")
     fetch_end   = (max_date + timedelta(days=8)).strftime("%Y-%m-%d")
 
-    results      = {}
-    failed       = []
-    failed_errors = {}   # symbol → error reason for display
+    results       = {}
+    failed        = []
+    failed_errors = {}   # symbol → reason, shown in the warning box
 
     progress = st.progress(0, text="Starting…")
     total = len(symbols)
@@ -179,7 +202,7 @@ def fetch_prices(symbols, date_objects):
 
             if df.empty:
                 failed.append(symbol)
-                failed_errors[symbol] = "No data returned (check NSE ticker or date range)"
+                failed_errors[symbol] = f"No data returned for {ticker} — verify NSE ticker"
                 results[symbol] = {}
                 time.sleep(REQUEST_DELAY)
                 continue
@@ -204,7 +227,7 @@ def fetch_prices(symbols, date_objects):
             failed_errors[symbol] = str(e)[:120]
             results[symbol] = {}
 
-        time.sleep(REQUEST_DELAY)   # polite delay between each symbol
+        time.sleep(REQUEST_DELAY)
 
     progress.progress(100, text="Done!")
     return results, failed, failed_errors
@@ -315,10 +338,10 @@ if raw_input.strip():
             """, unsafe_allow_html=True)
 
             if failed:
-                failed_details = " &nbsp;|&nbsp; ".join(
+                failed_lines = "<br>".join(
                     f"<strong>{s}</strong>: {failed_errors.get(s, 'unknown error')}" for s in failed
                 )
-                st.markdown(f'<div class="warn-box">⚠️ Failed symbols — {failed_details}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="warn-box">⚠️ Failed symbols — check NSE ticker or try again:<br>{failed_lines}</div>', unsafe_allow_html=True)
 
             # Preview — cap at 15 date columns for display
             st.markdown("### Preview")
