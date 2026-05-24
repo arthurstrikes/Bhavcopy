@@ -288,40 +288,60 @@ def to_excel(df):
     buf.seek(0)
     return buf
 
+# ── EXAMPLE FORMAT (always visible) ──────────────────────────
+with st.expander("📊 See example input format", expanded=False):
+    st.dataframe(
+        pd.DataFrame({
+            "Symbol":    ["TVSMOTOR","HCLTECH","TATASTEEL","CANBK","KIRLOSENG"],
+            "29-Sep-25": [""]*5,
+            "02-Nov-25": [""]*5,
+            "28-Nov-25": [""]*5,
+            "17-Apr-26": [""]*5,
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption("Replicate this structure in Excel — symbols in rows, dates in columns, prices blank. Copy → paste above.")
+
+# ── FETCH BUTTON (always visible) ────────────────────────────
+fetch_clicked = st.button("🔄 Fetch Closing Prices", type="primary", use_container_width=True)
+
 # ── MAIN FLOW ────────────────────────────────────────────────
-if raw_input.strip():
-    symbols, dates_with_labels, unparsed = parse_input(raw_input)
-
-    if symbols is None:
-        st.error(dates_with_labels)   # error string in second slot
+if fetch_clicked:
+    if not raw_input.strip():
+        st.error("⚠️ Please paste your Symbol × Date table above before fetching.")
     else:
-        date_objects = [d for _, d in dates_with_labels]
+        symbols, dates_with_labels, unparsed = parse_input(raw_input)
 
-        st.markdown(f"""
-        <div class="success-box">
-        ✅ Parsed — <strong>{len(symbols)} stocks</strong> × <strong>{len(dates_with_labels)} dates</strong>
-        &nbsp;|&nbsp; Range: <strong>{min(date_objects).strftime('%d-%b-%Y')}</strong>
-        to <strong>{max(date_objects).strftime('%d-%b-%Y')}</strong>
-        </div>
-        """, unsafe_allow_html=True)
+        if symbols is None:
+            st.error(dates_with_labels)   # error string in second slot
+        else:
+            date_objects = [d for _, d in dates_with_labels]
 
-        if unparsed:
-            st.markdown(f'<div class="warn-box">⚠️ Skipped unrecognised date values: {", ".join(unparsed)}</div>', unsafe_allow_html=True)
+            st.markdown(f"""
+            <div class="success-box">
+            ✅ Parsed — <strong>{len(symbols)} stocks</strong> × <strong>{len(dates_with_labels)} dates</strong>
+            &nbsp;|&nbsp; Range: <strong>{min(date_objects).strftime('%d-%b-%Y')}</strong>
+            to <strong>{max(date_objects).strftime('%d-%b-%Y')}</strong>
+            </div>
+            """, unsafe_allow_html=True)
 
-        # Preview parsed inputs
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**Symbols detected:**")
-            st.write(", ".join(symbols))
-        with c2:
-            st.markdown("**Dates detected:**")
-            preview_dates = [d.strftime('%d-%b-%Y') for _, d in dates_with_labels[:12]]
-            suffix = f" … +{len(dates_with_labels)-12} more" if len(dates_with_labels) > 12 else ""
-            st.write(", ".join(preview_dates) + suffix)
+            if unparsed:
+                st.markdown(f'<div class="warn-box">⚠️ Skipped unrecognised date values: {", ".join(unparsed)}</div>', unsafe_allow_html=True)
 
-        st.markdown("---")
+            # Preview parsed inputs
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Symbols detected:**")
+                st.write(", ".join(symbols))
+            with c2:
+                st.markdown("**Dates detected:**")
+                preview_dates = [d.strftime('%d-%b-%Y') for _, d in dates_with_labels[:12]]
+                suffix = f" … +{len(dates_with_labels)-12} more" if len(dates_with_labels) > 12 else ""
+                st.write(", ".join(preview_dates) + suffix)
 
-        if st.button("🔄 Fetch Closing Prices", type="primary", use_container_width=True):
+            st.markdown("---")
+
             price_data, failed, failed_errors = fetch_prices(symbols, date_objects)
             output_df = build_output(symbols, dates_with_labels, price_data)
 
@@ -367,21 +387,23 @@ if raw_input.strip():
                 use_container_width=True,
             )
 
-else:
-    # Show example when nothing pasted yet
-    st.markdown("### Example input format")
-    st.dataframe(
-        pd.DataFrame({
-            "Symbol":    ["TVSMOTOR","HCLTECH","TATASTEEL","CANBK","KIRLOSENG"],
-            "29-Sep-25": [""]*5,
-            "02-Nov-25": [""]*5,
-            "28-Nov-25": [""]*5,
-            "17-Apr-26": [""]*5,
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.caption("Replicate this structure in Excel — symbols in rows, dates in columns, prices blank. Copy → paste above.")
+elif raw_input.strip():
+    # Input pasted but not yet fetched — show live parse preview
+    symbols, dates_with_labels, unparsed = parse_input(raw_input)
+    if symbols is None:
+        st.error(dates_with_labels)
+    else:
+        date_objects = [d for _, d in dates_with_labels]
+        st.markdown(f"""
+        <div class="success-box">
+        ✅ Parsed — <strong>{len(symbols)} stocks</strong> × <strong>{len(dates_with_labels)} dates</strong>
+        &nbsp;|&nbsp; Range: <strong>{min(date_objects).strftime('%d-%b-%Y')}</strong>
+        to <strong>{max(date_objects).strftime('%d-%b-%Y')}</strong>
+        &nbsp;|&nbsp; Ready — click <strong>Fetch Closing Prices</strong> above.
+        </div>
+        """, unsafe_allow_html=True)
+        if unparsed:
+            st.markdown(f'<div class="warn-box">⚠️ Skipped unrecognised date values: {", ".join(unparsed)}</div>', unsafe_allow_html=True)
 
 # ── FOOTER ───────────────────────────────────────────────────
 st.markdown("---")
