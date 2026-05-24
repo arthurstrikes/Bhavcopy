@@ -24,8 +24,8 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown('<div class="title">📋 Bhavcopy — NSE Closing Prices</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Paste your stock × date matrix from Excel. Get NSE closing prices back instantly.</div>', unsafe_allow_html=True)
+st.markdown('<div class="title">📋 Bhavcopy — NSE/BSE Closing Prices</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Paste your stock × date matrix from Excel. Get NSE stock and index (NSE + BSE) closing prices back instantly.</div>', unsafe_allow_html=True)
 
 # ── HOW TO USE ───────────────────────────────────────────────
 with st.expander("📖 How to use", expanded=False):
@@ -36,8 +36,11 @@ Symbol      29-Sep-25   02-Nov-25   17-Apr-26
 TVSMOTOR
 HCLTECH
 TATASTEEL
+NIFTY50
+SENSEX
+BANKNIFTY
 ```
-- First column = NSE ticker symbols (e.g. HCLTECH, M&M, TATASTEEL)
+- First column = NSE ticker symbols **or index names** (see supported indexes below)
 - First row = dates in any format (29-Sep-25, 29/09/2025, 2025-09-29 — all work)
 - Leave all price cells empty — the app fills them
 
@@ -47,16 +50,27 @@ TATASTEEL
 
 **Step 4 — Download filled matrix as Excel**
 
+**Supported index names (type exactly as shown):**
+
+| Category | Names you can type |
+|---|---|
+| NSE Broad | `NIFTY50`, `NIFTY100`, `NIFTY200`, `NIFTY500`, `NIFTYNEXT50` |
+| NSE Mid/Small | `NIFTYMIDCAP100`, `NIFTYMID100`, `NIFTYSMALLCAP100`, `NIFTYSC100` |
+| NSE Sectoral | `BANKNIFTY`, `NIFTYIT`, `NIFTYAUTO`, `NIFTYPHARMA`, `NIFTYFMCG`, `NIFTYMETAL`, `NIFTYREALTY`, `NIFTYENERGY`, `NIFTYPSUBANK`, `FINNIFTY` |
+| BSE Broad | `SENSEX`, `BSE100`, `BSE200`, `BSE500` |
+| BSE Mid/Small | `BSEMIDCAP`, `BSESMALLCAP` |
+| BSE Sectoral | `BSEBANK`, `BSEIT`, `BSEAUTO`, `BSEPHARMA`, `BSEFMCG`, `BSEMETAL`, `BSEREALTY`, `BSEENERGY` |
+| Volatility | `INDIAVIX`, `VIX` |
+
 **Notes:**
 - Market holidays and weekends will show as blank
-- Use exact NSE ticker symbols
-- M&M, BAJAJ-AUTO, L&T etc. — use the NSE code exactly as listed
-- Large requests (50+ stocks × many dates) will take 2–4 minutes — be patient
+- Stocks: use exact NSE ticker symbols (M&M, BAJAJ-AUTO, L&T etc.)
+- Large requests (50+ rows × many dates) will take 2–4 minutes — be patient
     """)
 
 # ── INPUT ────────────────────────────────────────────────────
 st.markdown("### Paste your table here")
-st.markdown('<div class="info-box">Copy your Symbol × Date table from Excel and paste below. First column = symbols, first row = dates, rest left blank.</div>', unsafe_allow_html=True)
+st.markdown('<div class="info-box">Copy your Symbol × Date table from Excel and paste below. First column = NSE stock symbols <strong>or index names</strong> (NIFTY50, SENSEX, BANKNIFTY…), first row = dates, rest left blank.</div>', unsafe_allow_html=True)
 
 raw_input = st.text_area(
     label="Paste here",
@@ -124,29 +138,172 @@ def parse_input(raw):
 
 # ── TICKER ALIAS MAP ─────────────────────────────────────────
 # Maps common shorthand / alternate names → correct Yahoo Finance NSE ticker
-# Add new entries here as you discover mismatches
 TICKER_ALIASES = {
-    # GMDC is the common name; Yahoo Finance uses the full registered ticker
     "GMDC":         "GMDCLTD",
-    # Common shorthand variations
     "LT":           "LT",
     "M&M":          "M&M",
     "MM":           "M&M",
     "BAJAJ AUTO":   "BAJAJ-AUTO",
     "BAJAJ_AUTO":   "BAJAJ-AUTO",
-    # NMDC Steel subsidiary (different from parent NMDC)
     "NMDCSTEEL":    "NSLNISP",
-    # Motherson Sumi rebranded
     "MOTHERSUMI":   "MOTHERSON",
-    # Occasionally mistyped
     "LTIM":         "LTIM",
     "LTIMINDTREE":  "LTIM",
     "HINDZINC":     "HINDZINC",
 }
 
+# ── INDEX TICKER MAP ──────────────────────────────────────────
+# Maps common index names (what analysts type) → Yahoo Finance ticker
+# Indexes have no .NS / .BO suffix — they use ^ or .BO format directly
+INDEX_TICKERS = {
+    # ── NSE Broad Market ─────────────────────────────────────
+    "NIFTY50":          "^NSEI",
+    "NIFTY 50":         "^NSEI",
+    "NIFTY":            "^NSEI",
+    "NIFTY100":         "^CNX100",
+    "NIFTY 100":        "^CNX100",
+    "NIFTY200":         "^CNX200",
+    "NIFTY 200":        "^CNX200",
+    "NIFTY500":         "^CNX500",
+    "NIFTY 500":        "^CNX500",
+    "NIFTYNEXT50":      "^NSMIDCP50",   # Nifty Next 50
+    "NIFTY NEXT 50":    "^NSMIDCP50",
+    "NIFTYJR":          "^NSMIDCP50",
+
+    # ── NSE Midcap / Smallcap ────────────────────────────────
+    "NIFTYMIDCAP50":    "^NSEMDCP50",
+    "NIFTYMID50":       "^NSEMDCP50",
+    "NIFTYMIDCAP100":   "^CNXMIDCAP",
+    "NIFTYMID100":      "^CNXMIDCAP",
+    "NIFTYMIDCAP150":   "NIFTYMIDCAP150.NS",
+    "NIFTYMID150":      "NIFTYMIDCAP150.NS",
+    "NIFTYSMALLCAP50":  "^CNXSC",
+    "NIFTYSC50":        "^CNXSC",
+    "NIFTYSMALLCAP100": "^CNXSC",
+    "NIFTYSC100":       "^CNXSC",
+    "NIFTYSMALLCAP250": "NIFTYSMALLCAP250.NS",
+    "NIFTYSC250":       "NIFTYSMALLCAP250.NS",
+    "NIFTYMICROCAP250": "NIFTYMICROCAP250.NS",
+
+    # ── NSE Sectoral ─────────────────────────────────────────
+    "BANKNIFTY":        "^NSEBANK",
+    "NIFTYBANK":        "^NSEBANK",
+    "NIFTY BANK":       "^NSEBANK",
+    "NIFTYIT":          "^CNXIT",
+    "NIFTY IT":         "^CNXIT",
+    "NIFTYAUTO":        "^CNXAUTO",
+    "NIFTY AUTO":       "^CNXAUTO",
+    "NIFTYPHARMA":      "^CNXPHARMA",
+    "NIFTY PHARMA":     "^CNXPHARMA",
+    "NIFTYFMCG":        "^CNXFMCG",
+    "NIFTY FMCG":       "^CNXFMCG",
+    "NIFTYMETAL":       "^CNXMETAL",
+    "NIFTY METAL":      "^CNXMETAL",
+    "NIFTYREALTY":      "^CNXREALTY",
+    "NIFTY REALTY":     "^CNXREALTY",
+    "NIFTYENERGY":      "^CNXENERGY",
+    "NIFTY ENERGY":     "^CNXENERGY",
+    "NIFTYINFRA":       "^CNXINFRA",
+    "NIFTY INFRA":      "^CNXINFRA",
+    "NIFTYMEDIA":       "^CNXMEDIA",
+    "NIFTY MEDIA":      "^CNXMEDIA",
+    "NIFTYPSUBANK":     "^CNXPSUBANK",
+    "NIFTY PSU BANK":   "^CNXPSUBANK",
+    "NIFTYPSU":         "^CNXPSE",
+    "NIFTY PSU":        "^CNXPSE",
+    "NIFTYPSE":         "^CNXPSE",
+    "NIFTYFINSERVICE":  "NIFTYFINSERVICE.NS",
+    "NIFTY FIN SERVICE":"NIFTYFINSERVICE.NS",
+    "FINNIFTY":         "NIFTYFINSERVICE.NS",
+    "NIFTYHEALTHCARE":  "^CNXPHARMA",   # closest proxy
+    "NIFTYCONSUMER":    "NIFTYCONSUMPTION.NS",
+    "NIFTYOILGAS":      "NIFTYOILGAS.NS",
+    "NIFTYMFG":         "NIFTYMFG.NS",
+    "NIFTYDEFENCE":     "NIFTYDEFENCE.NS",
+
+    # ── NSE Strategy / Other ────────────────────────────────
+    "NIFTYALPHA50":     "NIFTYALPHA50.NS",
+    "NIFTYDIVIDEND":    "^CNXDIVID",
+    "NIFTYGROWTH":      "^CNXGRW25",
+    "NIFTYCPSE":        "^CNXCPSE",
+    "INDIA VIX":        "^INDIAVIX",
+    "INDIAVIX":         "^INDIAVIX",
+    "VIX":              "^INDIAVIX",
+
+    # ── BSE Broad Market ────────────────────────────────────
+    "SENSEX":           "^BSESN",
+    "BSE SENSEX":       "^BSESN",
+    "BSE30":            "^BSESN",
+    "BSE100":           "BSE-100.BO",
+    "BSE 100":          "BSE-100.BO",
+    "BSE200":           "BSE-200.BO",
+    "BSE 200":          "BSE-200.BO",
+    "BSE500":           "BSE-500.BO",
+    "BSE 500":          "BSE-500.BO",
+
+    # ── BSE Midcap / Smallcap ───────────────────────────────
+    "BSEMIDCAP":        "BSE-MIDCAP.BO",
+    "BSE MIDCAP":       "BSE-MIDCAP.BO",
+    "BSESMALLCAP":      "BSE-SMLCAP.BO",
+    "BSE SMALLCAP":     "BSE-SMLCAP.BO",
+    "BSE SMLCAP":       "BSE-SMLCAP.BO",
+    "BSEMICROCAP":      "BSE-MICROCAP.BO",
+    "BSE MICROCAP":     "BSE-MICROCAP.BO",
+    "BSELARGECAP":      "BSE-LARGECAP.BO",
+    "BSE LARGECAP":     "BSE-LARGECAP.BO",
+
+    # ── BSE Sectoral ────────────────────────────────────────
+    "BSEBANK":          "BSE-BANK.BO",
+    "BSE BANK":         "BSE-BANK.BO",
+    "BSEIT":            "BSE-IT.BO",
+    "BSE IT":           "BSE-IT.BO",
+    "BSEAUTO":          "BSE-AUTO.BO",
+    "BSE AUTO":         "BSE-AUTO.BO",
+    "BSEPHARMA":        "BSE-HEALTHCARE.BO",
+    "BSE PHARMA":       "BSE-HEALTHCARE.BO",
+    "BSEHEALTHCARE":    "BSE-HEALTHCARE.BO",
+    "BSE HEALTHCARE":   "BSE-HEALTHCARE.BO",
+    "BSEFMCG":          "BSE-FMCG.BO",
+    "BSE FMCG":         "BSE-FMCG.BO",
+    "BSEMETAL":         "BSE-METAL.BO",
+    "BSE METAL":        "BSE-METAL.BO",
+    "BSEREALTY":        "BSE-REALTY.BO",
+    "BSE REALTY":       "BSE-REALTY.BO",
+    "BSEENERGY":        "BSE-ENERGY.BO",
+    "BSE ENERGY":       "BSE-ENERGY.BO",
+    "BSEOILGAS":        "BSE-OIL&GAS.BO",
+    "BSE OIL GAS":      "BSE-OIL&GAS.BO",
+    "BSECAPGOODS":      "BSE-CARGDS.BO",
+    "BSE CAP GOODS":    "BSE-CARGDS.BO",
+    "BSEPSU":           "BSE-PSU.BO",
+    "BSE PSU":          "BSE-PSU.BO",
+    "BSEFINANCE":       "BSE-FIN.BO",
+    "BSE FINANCE":      "BSE-FIN.BO",
+    "BSEPOWER":         "BSE-POWER.BO",
+    "BSE POWER":        "BSE-POWER.BO",
+    "BSETECK":          "BSE-TECK.BO",
+    "BSE TECK":         "BSE-TECK.BO",
+    "BSECONSUMERDURABLES": "BSE-CONSDUR.BO",
+    "BSE CONSUMER DURABLES": "BSE-CONSDUR.BO",
+    "BSEINDUSTRIALS":   "BSE-INDUS.BO",
+    "BSE INDUSTRIALS":  "BSE-INDUS.BO",
+    "BSETELECOMMUNICATION": "BSE-TELECOM.BO",
+    "BSE TELECOM":      "BSE-TELECOM.BO",
+    "BSEUTILS":         "BSE-UTILS.BO",
+    "BSE UTILITIES":    "BSE-UTILS.BO",
+}
+
+def is_index(symbol):
+    """Returns True if symbol is a known index name."""
+    return symbol.strip().upper() in INDEX_TICKERS
+
 def to_yf_ticker(symbol):
     symbol = symbol.strip().upper()
-    symbol = TICKER_ALIASES.get(symbol, symbol)   # apply alias if exists
+    # Check index map first — indexes have their own Yahoo tickers, no .NS suffix
+    if symbol in INDEX_TICKERS:
+        return INDEX_TICKERS[symbol]
+    # Apply stock alias if exists, then append .NS
+    symbol = TICKER_ALIASES.get(symbol, symbol)
     return symbol + ".NS"
 
 # ── FETCH PRICES ─────────────────────────────────────────────
@@ -202,7 +359,10 @@ def fetch_prices(symbols, date_objects):
 
             if df.empty:
                 failed.append(symbol)
-                failed_errors[symbol] = f"No data returned for {ticker} — verify NSE ticker"
+                if is_index(symbol):
+                    failed_errors[symbol] = f"No data for index {ticker} — may not be available on Yahoo Finance for this date range"
+                else:
+                    failed_errors[symbol] = f"No data returned for {ticker} — verify NSE ticker"
                 results[symbol] = {}
                 time.sleep(REQUEST_DELAY)
                 continue
@@ -292,16 +452,16 @@ def to_excel(df):
 with st.expander("📊 See example input format", expanded=False):
     st.dataframe(
         pd.DataFrame({
-            "Symbol":    ["TVSMOTOR","HCLTECH","TATASTEEL","CANBK","KIRLOSENG"],
-            "29-Sep-25": [""]*5,
-            "02-Nov-25": [""]*5,
-            "28-Nov-25": [""]*5,
-            "17-Apr-26": [""]*5,
+            "Symbol":    ["TVSMOTOR","HCLTECH","TATASTEEL","NIFTY50","SENSEX","BANKNIFTY"],
+            "29-Sep-25": [""]*6,
+            "02-Nov-25": [""]*6,
+            "28-Nov-25": [""]*6,
+            "17-Apr-26": [""]*6,
         }),
         use_container_width=True,
         hide_index=True,
     )
-    st.caption("Replicate this structure in Excel — symbols in rows, dates in columns, prices blank. Copy → paste above.")
+    st.caption("Mix stocks and index names freely — the app auto-detects which is which.")
 
 # ── FETCH BUTTON (always visible) ────────────────────────────
 fetch_clicked = st.button("🔄 Fetch Closing Prices", type="primary", use_container_width=True)
@@ -318,9 +478,16 @@ if fetch_clicked:
         else:
             date_objects = [d for _, d in dates_with_labels]
 
+            index_syms = [s for s in symbols if is_index(s)]
+            stock_syms = [s for s in symbols if not is_index(s)]
+            breakdown = ""
+            if index_syms:
+                breakdown = f"&nbsp;|&nbsp; <strong>{len(stock_syms)}</strong> stocks + <strong>{len(index_syms)}</strong> indexes"
+
             st.markdown(f"""
             <div class="success-box">
-            ✅ Parsed — <strong>{len(symbols)} stocks</strong> × <strong>{len(dates_with_labels)} dates</strong>
+            ✅ Parsed — <strong>{len(symbols)} rows</strong> × <strong>{len(dates_with_labels)} dates</strong>
+            {breakdown}
             &nbsp;|&nbsp; Range: <strong>{min(date_objects).strftime('%d-%b-%Y')}</strong>
             to <strong>{max(date_objects).strftime('%d-%b-%Y')}</strong>
             </div>
@@ -394,9 +561,16 @@ elif raw_input.strip():
         st.error(dates_with_labels)
     else:
         date_objects = [d for _, d in dates_with_labels]
+        index_syms = [s for s in symbols if is_index(s)]
+        stock_syms = [s for s in symbols if not is_index(s)]
+        breakdown = ""
+        if index_syms:
+            breakdown = f"&nbsp;|&nbsp; <strong>{len(stock_syms)}</strong> stocks + <strong>{len(index_syms)}</strong> indexes"
+
         st.markdown(f"""
         <div class="success-box">
-        ✅ Parsed — <strong>{len(symbols)} stocks</strong> × <strong>{len(dates_with_labels)} dates</strong>
+        ✅ Parsed — <strong>{len(symbols)} rows</strong> × <strong>{len(dates_with_labels)} dates</strong>
+        {breakdown}
         &nbsp;|&nbsp; Range: <strong>{min(date_objects).strftime('%d-%b-%Y')}</strong>
         to <strong>{max(date_objects).strftime('%d-%b-%Y')}</strong>
         &nbsp;|&nbsp; Ready — click <strong>Fetch Closing Prices</strong> above.
@@ -407,4 +581,4 @@ elif raw_input.strip():
 
 # ── FOOTER ───────────────────────────────────────────────────
 st.markdown("---")
-st.caption("Bhavcopy v1.0  |  NSE closing prices via Yahoo Finance (unadjusted)  |  Blanks = market holiday or weekend  |  Built for Motilal Oswal Research")
+st.caption("Bhavcopy v1.1  |  NSE stocks + NSE/BSE indexes via Yahoo Finance (unadjusted)  |  Blanks = market holiday or weekend  |  Built for Motilal Oswal Research")
