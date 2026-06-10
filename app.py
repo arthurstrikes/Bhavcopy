@@ -76,8 +76,13 @@ raw_input = st.text_area(
     label="Paste here",
     height=220,
     placeholder="Symbol\t29-Sep-25\t02-Nov-25\t17-Apr-26\nTVSMOTOR\t\t\t\nHCLTECH\t\t\t\nTATASTEEL\t\t\t",
-    label_visibility="collapsed"
+    label_visibility="collapsed",
+    key="raw_input_area"
 )
+# Persist full input in session_state to survive reruns without truncation
+if raw_input:
+    st.session_state["last_raw_input"] = raw_input
+raw_input = st.session_state.get("last_raw_input", raw_input)
 
 # ── PARSE DATE ───────────────────────────────────────────────
 def parse_date_flexible(date_str):
