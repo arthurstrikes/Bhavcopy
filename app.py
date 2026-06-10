@@ -111,7 +111,13 @@ def parse_input(raw):
         return None, None, "Need at least a header row and one stock row."
 
     header      = lines[0].split('\t')
-    date_strings = [h.strip() for h in header[1:] if h.strip()]
+    # If the first cell itself parses as a date, the Symbol header is absent —
+    # treat ALL cells as dates. Otherwise skip the first (Symbol) cell as normal.
+    first_cell = header[0].strip()
+    if first_cell and parse_date_flexible(first_cell):
+        date_strings = [h.strip() for h in header if h.strip()]
+    else:
+        date_strings = [h.strip() for h in header[1:] if h.strip()]
 
     dates, unparsed = [], []
     for ds in date_strings:
@@ -341,7 +347,7 @@ def fetch_prices(symbols, date_objects):
     max_date = max(date_objects)
 
     fetch_start = (min_date - timedelta(days=7)).strftime("%Y-%m-%d")
-    fetch_end   = (max_date + timedelta(days=8)).strftime("%Y-%m-%d")
+    fetch_end   = (max_date + timedelta(days=12)).strftime("%Y-%m-%d")
 
     results       = {}
     failed        = []
