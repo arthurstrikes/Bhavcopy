@@ -2,9 +2,10 @@ import streamlit as st
 import pandas as pd
 import yfinance as yf
 from io import BytesIO
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import time
 
+# ── PAGE CONFIG ──────────────────────────────────────────────
 st.set_page_config(
     page_title="Bhavcopy – NSE Close Prices",
     page_icon="📋",
@@ -25,66 +26,76 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="title">📋 Bhavcopy — NSE/BSE Closing Prices</div>', unsafe_allow_html=True)
-st.markdown('<div class="subtitle">Paste your stock × date matrix from Excel. Get NSE stock and index (NSE + BSE) closing prices back instantly.</div>', unsafe_allow_html=True)
+st.markdown('<div class="subtitle">Fetch NSE/BSE stock and index closing prices. Paste from Excel or type symbols directly.</div>', unsafe_allow_html=True)
 
 # ── HOW TO USE ───────────────────────────────────────────────
 with st.expander("📖 How to use", expanded=False):
     st.markdown("""
-**Step 1 — Prepare your table in Excel:**
+**Two ways to get prices:**
+
+---
+
+**📋 Matrix Mode** — Best when you already have a table in Excel
+
+Set up your table with stock/index names in the first column and dates in the first row:
 ```
 Symbol      29-Sep-25   02-Nov-25   17-Apr-26
-TVSMOTOR
-HCLTECH
-TATASTEEL
+RELIANCE
+INFY
 NIFTY50
 SENSEX
-BANKNIFTY
 ```
-- First column = NSE ticker symbols **or index names** (see supported indexes below)
-- First row = dates in any format (29-Sep-25, 29/09/2025, 2025-09-29 — all work)
-- Leave all price cells empty — the app fills them
+Select all → Copy → Paste into the Matrix tab → click **Fetch Closing Prices**.
 
-**Step 2 — Select all in Excel (Ctrl+A) → Copy (Ctrl+C)**
+💡 **No dates in your table?** Just paste the symbol list and the app will automatically fetch the last available trading day's closes.
 
-**Step 3 — Paste below → click Fetch Prices**
+---
 
-**Step 4 — Download filled matrix as Excel**
+**⚡ Quick Fetch** — Best for quick lookups without needing Excel
 
-**Supported index names (type exactly as shown):**
+Type stock or index names (one per line or comma-separated), pick your date option, and fetch.
+Options: **Last trading day** (default), **specific dates**, or a **date range**.
 
-| Category | Names you can type |
+---
+
+**Options (work in both modes):**
+
+| Option | What it does |
+|---|---|
+| **Fill holidays** | Holiday/weekend cells show nearest prior trading day's close, marked `*` in Excel. Off = leave blank. |
+| **Adjusted prices** | Toggle between unadjusted (default) and split/dividend-adjusted closes. |
+
+---
+
+**Supported index names:**
+
+| Category | Type exactly as shown |
 |---|---|
 | NSE Broad | `NIFTY50`, `NIFTY100`, `NIFTY200`, `NIFTY500`, `NIFTYNEXT50` |
 | NSE Mid/Small | `NIFTYMIDCAP100`, `NIFTYMID100`, `NIFTYSMALLCAP100`, `NIFTYSC100` |
 | NSE Sectoral | `BANKNIFTY`, `NIFTYIT`, `NIFTYAUTO`, `NIFTYPHARMA`, `NIFTYFMCG`, `NIFTYMETAL`, `NIFTYREALTY`, `NIFTYENERGY`, `NIFTYPSUBANK`, `FINNIFTY` |
+| NSE Composite† | `NIFTYMIDSML400`, `NIFTY200MOM30`, `NIFTYLARGEMID250` |
 | BSE Broad | `SENSEX`, `BSE100`, `BSE200`, `BSE500` |
 | BSE Mid/Small | `BSEMIDCAP`, `BSESMALLCAP` |
 | BSE Sectoral | `BSEBANK`, `BSEIT`, `BSEAUTO`, `BSEPHARMA`, `BSEFMCG`, `BSEMETAL`, `BSEREALTY`, `BSEENERGY` |
 | Volatility | `INDIAVIX`, `VIX` |
 
+† NSE Composite indices are not available on Yahoo Finance. The app will flag them and direct you to download from NSE India manually.
+
 **Notes:**
-- Market holidays and weekends will show as blank
-- Stocks: use exact NSE ticker symbols (M&M, BAJAJ-AUTO, L&T etc.)
-- Large requests (50+ rows × many dates) will take 2–4 minutes — be patient
+- Use exact NSE ticker symbols for stocks: `BAJAJ-AUTO`, `M&M`, `L&T` etc.
+- Large batches (50+ stocks × many dates) take 2–4 minutes.
+- Adjusted prices affect historical values — use unadjusted for most report work.
     """)
 
-# ── INPUT ────────────────────────────────────────────────────
-st.markdown("### Paste your table here")
-st.markdown('<div class="info-box">Copy your Symbol × Date table from Excel and paste below. First column = NSE stock symbols <strong>or index names</strong> (NIFTY50, SENSEX, BANKNIFTY…), first row = dates, rest left blank.</div>', unsafe_allow_html=True)
+# ── UTILITY FUNCTIONS ────────────────────────────────────────
+def last_trading_day():
+    """Most recent completed weekday (yesterday or earlier). Does not account for market holidays."""
+    d = date.today() - timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= timedelta(days=1)
+    return d
 
-raw_input = st.text_area(
-    label="Paste here",
-    height=220,
-    placeholder="Symbol\t29-Sep-25\t02-Nov-25\t17-Apr-26\nTVSMOTOR\t\t\t\nHCLTECH\t\t\t\nTATASTEEL\t\t\t",
-    label_visibility="collapsed",
-    key="raw_input_area"
-)
-# Persist full input in session_state to survive reruns without truncation
-if raw_input:
-    st.session_state["last_raw_input"] = raw_input
-raw_input = st.session_state.get("last_raw_input", raw_input)
-
-# ── PARSE DATE ───────────────────────────────────────────────
 def parse_date_flexible(date_str):
     date_str = str(date_str).strip()
     if not date_str or date_str.lower() in ('nan', 'none', ''):
@@ -109,20 +120,26 @@ def parse_date_flexible(date_str):
     except:
         return None
 
-# ── PARSE INPUT ──────────────────────────────────────────────
+# ── PARSE MATRIX INPUT ───────────────────────────────────────
 def parse_input(raw):
+    """
+    Returns: (symbols, dates_with_labels, unparsed, auto_date)
+    On error: (None, error_string, [], False)
+    auto_date=True means no dates were found — last trading day was auto-applied.
+    """
     lines = raw.strip().split('\n')
-    if len(lines) < 2:
-        return None, None, "Need at least a header row and one stock row."
+    if len(lines) < 1:
+        return None, "Nothing pasted.", [], False
 
-    header      = lines[0].split('\t')
-    # If the first cell itself parses as a date, the Symbol header is absent —
-    # treat ALL cells as dates. Otherwise skip the first (Symbol) cell as normal.
+    header     = lines[0].split('\t')
     first_cell = header[0].strip()
+
     if first_cell and parse_date_flexible(first_cell):
         date_strings = [h.strip() for h in header if h.strip()]
+        symbol_lines = lines
     else:
         date_strings = [h.strip() for h in header[1:] if h.strip()]
+        symbol_lines = lines[1:]
 
     dates, unparsed = [], []
     for ds in date_strings:
@@ -132,23 +149,32 @@ def parse_input(raw):
         else:
             unparsed.append(ds)
 
+    # Zero dates → auto-use last trading day
+    auto_date = False
     if not dates:
-        return None, None, "Could not parse any dates from the header row. Check date format."
+        ltd = last_trading_day()
+        dates = [(ltd.strftime('%d-%b-%Y'), ltd)]
+        auto_date = True
 
     symbols = []
-    for line in lines[1:]:
+    for line in symbol_lines:
         parts = line.split('\t')
         sym = parts[0].strip().upper()
         if sym:
             symbols.append(sym)
 
     if not symbols:
-        return None, None, "No stock symbols found in the first column."
+        return None, "No stock symbols found in the first column.", [], False
 
-    return symbols, dates, unparsed
+    return symbols, dates, unparsed, auto_date
+
+# ── PARSE QUICK FETCH SYMBOLS ────────────────────────────────
+def parse_quick_symbols(raw):
+    """Accepts newline or comma-separated symbol list."""
+    raw = raw.replace(',', '\n')
+    return [s.strip().upper() for s in raw.split('\n') if s.strip()]
 
 # ── TICKER ALIAS MAP ─────────────────────────────────────────
-# Maps common shorthand / alternate names → correct Yahoo Finance NSE ticker
 TICKER_ALIASES = {
     "GMDC":         "GMDCLTD",
     "LT":           "LT",
@@ -163,9 +189,7 @@ TICKER_ALIASES = {
     "HINDZINC":     "HINDZINC",
 }
 
-# ── INDEX TICKER MAP ──────────────────────────────────────────
-# Maps common index names (what analysts type) → Yahoo Finance ticker
-# Indexes have no .NS / .BO suffix — they use ^ or .BO format directly
+# ── INDEX TICKER MAP ─────────────────────────────────────────
 INDEX_TICKERS = {
     # ── NSE Broad Market ─────────────────────────────────────
     "NIFTY50":          "^NSEI",
@@ -175,9 +199,9 @@ INDEX_TICKERS = {
     "NIFTY 100":        "^CNX100",
     "NIFTY200":         "^CNX200",
     "NIFTY 200":        "^CNX200",
-    "NIFTY500":         "^CNX500",
-    "NIFTY 500":        "^CNX500",
-    "NIFTYNEXT50":      "^NSMIDCP50",   # Nifty Next 50
+    "NIFTY500":         "^CRSLDX",
+    "NIFTY 500":        "^CRSLDX",
+    "NIFTYNEXT50":      "^NSMIDCP50",
     "NIFTY NEXT 50":    "^NSMIDCP50",
     "NIFTYJR":          "^NSMIDCP50",
 
@@ -226,22 +250,35 @@ INDEX_TICKERS = {
     "NIFTYFINSERVICE":  "NIFTYFINSERVICE.NS",
     "NIFTY FIN SERVICE":"NIFTYFINSERVICE.NS",
     "FINNIFTY":         "NIFTYFINSERVICE.NS",
-    "NIFTYHEALTHCARE":  "^CNXPHARMA",   # closest proxy
+    "NIFTYHEALTHCARE":  "^CNXPHARMA",
     "NIFTYCONSUMER":    "NIFTYCONSUMPTION.NS",
     "NIFTYOILGAS":      "NIFTYOILGAS.NS",
     "NIFTYMFG":         "NIFTYMFG.NS",
     "NIFTYDEFENCE":     "NIFTYDEFENCE.NS",
 
-    # ── NSE Strategy / Other ────────────────────────────────
-    "NIFTYALPHA50":     "NIFTYALPHA50.NS",
-    "NIFTYDIVIDEND":    "^CNXDIVID",
-    "NIFTYGROWTH":      "^CNXGRW25",
-    "NIFTYCPSE":        "^CNXCPSE",
-    "INDIA VIX":        "^INDIAVIX",
-    "INDIAVIX":         "^INDIAVIX",
-    "VIX":              "^INDIAVIX",
+    # ── NSE Strategy / Other ─────────────────────────────────
+    "NIFTYALPHA50":          "NIFTYALPHA50.NS",
+    "NIFTYDIVIDEND":         "^CNXDIVID",
+    "NIFTYGROWTH":           "^CNXGRW25",
+    "NIFTYCPSE":             "^CNXCPSE",
+    "INDIA VIX":             "^INDIAVIX",
+    "INDIAVIX":              "^INDIAVIX",
+    "VIX":                   "^INDIAVIX",
 
-    # ── BSE Broad Market ────────────────────────────────────
+    # ── NSE Composite / Factor (chart-only on YF; in YF_UNSUPPORTED_INDICES) ─
+    "NIFTYMIDSML400":        "NIFTYMIDSML400.NS",
+    "NIFTY MIDSML 400":      "NIFTYMIDSML400.NS",
+    "NIFTYMIDSMALL400":      "NIFTYMIDSML400.NS",
+    "NIFTY MID SMALL 400":   "NIFTYMIDSML400.NS",
+    "NIFTY200MOM30":         "NIFTY200MOMENTM30.NS",
+    "NIFTY200MOMENTUM30":    "NIFTY200MOMENTM30.NS",
+    "NIFTY200 MOMENTUM 30":  "NIFTY200MOMENTM30.NS",
+    "NIFTYLARGEMID250":      "NIFTY_LARGEMID250.NS",
+    "NIFTYLARGEMIDCAP250":   "NIFTY_LARGEMID250.NS",
+    "NIFTY LARGEMIDCAP 250": "NIFTY_LARGEMID250.NS",
+    "NIFTYLARGMID250":       "NIFTY_LARGEMID250.NS",
+
+    # ── BSE Broad Market ─────────────────────────────────────
     "SENSEX":           "^BSESN",
     "BSE SENSEX":       "^BSESN",
     "BSE30":            "^BSESN",
@@ -252,7 +289,7 @@ INDEX_TICKERS = {
     "BSE500":           "BSE-500.BO",
     "BSE 500":          "BSE-500.BO",
 
-    # ── BSE Midcap / Smallcap ───────────────────────────────
+    # ── BSE Midcap / Smallcap ────────────────────────────────
     "BSEMIDCAP":        "BSE-MIDCAP.BO",
     "BSE MIDCAP":       "BSE-MIDCAP.BO",
     "BSESMALLCAP":      "BSE-SMLCAP.BO",
@@ -263,7 +300,7 @@ INDEX_TICKERS = {
     "BSELARGECAP":      "BSE-LARGECAP.BO",
     "BSE LARGECAP":     "BSE-LARGECAP.BO",
 
-    # ── BSE Sectoral ────────────────────────────────────────
+    # ── BSE Sectoral ─────────────────────────────────────────
     "BSEBANK":          "BSE-BANK.BO",
     "BSE BANK":         "BSE-BANK.BO",
     "BSEIT":            "BSE-IT.BO",
@@ -304,25 +341,35 @@ INDEX_TICKERS = {
     "BSE UTILITIES":    "BSE-UTILS.BO",
 }
 
+# ── YF-UNSUPPORTED INDICES ───────────────────────────────────
+# Yahoo Finance shows charts but serves no downloadable historical OHLCV for these.
+# Listed in INDEX_TICKERS so is_index() recognises them and no double .NS is appended.
+# fetch_prices() detects them here and shows an actionable message.
+YF_UNSUPPORTED_INDICES = {
+    "NIFTYMIDSML400", "NIFTY MIDSML 400", "NIFTYMIDSMALL400", "NIFTY MID SMALL 400",
+    "NIFTY200MOM30", "NIFTY200MOMENTUM30", "NIFTY200 MOMENTUM 30",
+    "NIFTYLARGEMID250", "NIFTYLARGEMIDCAP250", "NIFTY LARGEMIDCAP 250", "NIFTYLARGMID250",
+}
+
 def is_index(symbol):
-    """Returns True if symbol is a known index name."""
     return symbol.strip().upper() in INDEX_TICKERS
 
 def to_yf_ticker(symbol):
     symbol = symbol.strip().upper()
-    # Check index map first — indexes have their own Yahoo tickers, no .NS suffix
     if symbol in INDEX_TICKERS:
         return INDEX_TICKERS[symbol]
-    # Apply stock alias if exists, then append .NS
     symbol = TICKER_ALIASES.get(symbol, symbol)
+    # Guard: don't double-suffix if analyst typed a full Yahoo ticker already
+    if symbol.endswith('.NS') or symbol.endswith('.BO') or symbol.startswith('^'):
+        return symbol
     return symbol + ".NS"
 
-# ── FETCH PRICES ─────────────────────────────────────────────
-MAX_RETRIES   = 3      # retry each symbol up to 3 times on failure
-RETRY_DELAY   = 4      # seconds to wait between retries
-REQUEST_DELAY = 0.5    # seconds between each symbol (avoids rate-limiting)
+# ── FETCH LOGIC ──────────────────────────────────────────────
+MAX_RETRIES   = 3
+RETRY_DELAY   = 4
+REQUEST_DELAY = 0.5
 
-def fetch_single(ticker, fetch_start, fetch_end):
+def fetch_single(ticker, fetch_start, fetch_end, adjusted=False):
     """Download data for one ticker with retries. Returns DataFrame or raises."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -332,7 +379,7 @@ def fetch_single(ticker, fetch_start, fetch_end):
                 end=fetch_end,
                 interval="1d",
                 progress=False,
-                auto_adjust=False,
+                auto_adjust=adjusted,
                 actions=False,
             )
             if not df.empty:
@@ -344,19 +391,24 @@ def fetch_single(ticker, fetch_start, fetch_end):
                 time.sleep(RETRY_DELAY)
             else:
                 raise e
-    return pd.DataFrame()   # all retries exhausted
+    return pd.DataFrame()
 
 
-def fetch_prices(symbols, date_objects):
+def fetch_prices(symbols, date_objects, fill_holidays=False, adjusted=False):
+    """
+    Returns: results, failed, failed_errors, holiday_fills
+    holiday_fills: set of date objects where prior-day fill was applied.
+    """
     min_date = min(date_objects)
     max_date = max(date_objects)
 
-    fetch_start = (min_date - timedelta(days=7)).strftime("%Y-%m-%d")
+    fetch_start = (min_date - timedelta(days=10)).strftime("%Y-%m-%d")
     fetch_end   = (max_date + timedelta(days=12)).strftime("%Y-%m-%d")
 
     results       = {}
     failed        = []
-    failed_errors = {}   # symbol → reason, shown in the warning box
+    failed_errors = {}
+    holiday_fills = set()   # dates where prior-day fill was applied
 
     progress = st.progress(0, text="Starting…")
     total = len(symbols)
@@ -366,11 +418,17 @@ def fetch_prices(symbols, date_objects):
         ticker = to_yf_ticker(symbol)
 
         try:
-            df = fetch_single(ticker, fetch_start, fetch_end)
+            df = fetch_single(ticker, fetch_start, fetch_end, adjusted=adjusted)
 
             if df.empty:
                 failed.append(symbol)
-                if is_index(symbol):
+                if symbol.upper() in YF_UNSUPPORTED_INDICES:
+                    failed_errors[symbol] = (
+                        "Not available via Yahoo Finance — download historical data manually from "
+                        "NSE India (nseindia.com → Reports → Index Historical Data) "
+                        "and paste closes into your Excel"
+                    )
+                elif is_index(symbol):
                     failed_errors[symbol] = f"No data for index {ticker} — may not be available on Yahoo Finance for this date range"
                 else:
                     failed_errors[symbol] = f"No data returned for {ticker} — verify NSE ticker"
@@ -388,8 +446,21 @@ def fetch_prices(symbols, date_objects):
                 if dt in df.index:
                     val = df.loc[dt, "Close"]
                     close_map[dt] = round(float(val), 2) if pd.notna(val) else None
+                elif fill_holidays:
+                    # Walk back up to 7 days to find nearest prior trading day
+                    filled = False
+                    for days_back in range(1, 8):
+                        prior = dt - timedelta(days=days_back)
+                        if prior in df.index:
+                            val = df.loc[prior, "Close"]
+                            close_map[dt] = round(float(val), 2) if pd.notna(val) else None
+                            holiday_fills.add(dt)
+                            filled = True
+                            break
+                    if not filled:
+                        close_map[dt] = None
                 else:
-                    close_map[dt] = None   # holiday / weekend → blank
+                    close_map[dt] = None   # holiday/weekend → blank
 
             results[symbol] = close_map
 
@@ -401,7 +472,8 @@ def fetch_prices(symbols, date_objects):
         time.sleep(REQUEST_DELAY)
 
     progress.progress(100, text="Done!")
-    return results, failed, failed_errors
+    return results, failed, failed_errors, holiday_fills
+
 
 # ── BUILD OUTPUT ─────────────────────────────────────────────
 def build_output(symbols, dates_with_labels, price_data):
@@ -413,41 +485,58 @@ def build_output(symbols, dates_with_labels, price_data):
         rows.append(row)
     return pd.DataFrame(rows)
 
+
 # ── EXCEL EXPORT ─────────────────────────────────────────────
-def to_excel(df):
+def to_excel(df, holiday_fills=None, dates_with_labels=None):
+    """
+    holiday_fills: set of date objects where prior-day fill was applied.
+    dates_with_labels: list of (label_str, date_obj) to map fills to column names.
+    Holiday columns get amber headers and a * suffix in the label.
+    """
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    # Rename holiday columns: append * to header label
+    holiday_label_set = set()
+    if holiday_fills and dates_with_labels:
+        for orig_label, dt in dates_with_labels:
+            if dt in holiday_fills:
+                holiday_label_set.add(orig_label)
+        if holiday_label_set:
+            df = df.rename(columns={lbl: lbl + "*" for lbl in holiday_label_set})
+
     buf = BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Bhavcopy")
 
-        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-        from openpyxl.utils import get_column_letter
-
-        ws  = writer.sheets["Bhavcopy"]
-        navy = PatternFill("solid", fgColor="1F3864")
-        thin = Side(style="thin", color="D0D0D0")
-        bdr  = Border(left=thin, right=thin, top=thin, bottom=thin)
+        ws   = writer.sheets["Bhavcopy"]
+        navy  = PatternFill("solid", fgColor="1F3864")
+        amber = PatternFill("solid", fgColor="FFF0A0")   # light amber for holiday cols
+        thin  = Side(style="thin", color="D0D0D0")
+        bdr   = Border(left=thin, right=thin, top=thin, bottom=thin)
 
         # Header row
-        for col in range(1, len(df.columns) + 1):
-            c = ws.cell(row=1, column=col)
-            c.fill = navy
-            c.font = Font(name="Arial", color="FFFFFF", bold=True, size=10)
+        for col_idx, col_name in enumerate(df.columns, start=1):
+            c = ws.cell(row=1, column=col_idx)
+            is_holiday_col = str(col_name).endswith("*")
+            c.fill      = amber if is_holiday_col else navy
+            c.font      = Font(name="Arial",
+                               color="000000" if is_holiday_col else "FFFFFF",
+                               bold=True, size=10)
             c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-            c.border = bdr
+            c.border    = bdr
 
         # Data rows
         for row in range(2, len(df) + 2):
-            # Symbol column
             c = ws.cell(row=row, column=1)
-            c.font = Font(name="Arial", bold=True, size=10)
+            c.font   = Font(name="Arial", bold=True, size=10)
             c.border = bdr
-            # Price columns
             for col in range(2, len(df.columns) + 1):
                 c = ws.cell(row=row, column=col)
-                c.font = Font(name="Arial", size=10)
+                c.font          = Font(name="Arial", size=10)
                 c.number_format = "#,##0.00"
-                c.alignment = Alignment(horizontal="right")
-                c.border = bdr
+                c.alignment     = Alignment(horizontal="right")
+                c.border        = bdr
 
         # Column widths
         ws.column_dimensions["A"].width = 16
@@ -456,44 +545,193 @@ def to_excel(df):
 
         ws.freeze_panes = "B2"
 
+        # Footer note if any holiday fills exist
+        if holiday_label_set:
+            note_row = len(df) + 3
+            note_cell = ws.cell(row=note_row, column=1)
+            note_cell.value = "* Holiday or weekend — nearest prior trading day close shown"
+            note_cell.font  = Font(name="Arial", italic=True, size=9, color="888888")
+
     buf.seek(0)
     return buf
 
-# ── EXAMPLE FORMAT (always visible) ──────────────────────────
-with st.expander("📊 See example input format", expanded=False):
-    st.dataframe(
-        pd.DataFrame({
-            "Symbol":    ["TVSMOTOR","HCLTECH","TATASTEEL","NIFTY50","SENSEX","BANKNIFTY"],
-            "29-Sep-25": [""]*6,
-            "02-Nov-25": [""]*6,
-            "28-Nov-25": [""]*6,
-            "17-Apr-26": [""]*6,
-        }),
-        use_container_width=True,
-        hide_index=True,
+
+# ── SHARED FETCH + DISPLAY ───────────────────────────────────
+def run_fetch_and_display(symbols, dates_with_labels, fill_holidays, adjusted, auto_date=False):
+    """Execute fetch and render results. Called from both Matrix and Quick Fetch tabs."""
+    date_objects  = [d for _, d in dates_with_labels]
+    index_syms    = [s for s in symbols if is_index(s)]
+    stock_syms    = [s for s in symbols if not is_index(s)]
+    breakdown     = ""
+    if index_syms:
+        breakdown = f"&nbsp;|&nbsp; <strong>{len(stock_syms)}</strong> stocks + <strong>{len(index_syms)}</strong> indexes"
+
+    auto_note = ""
+    if auto_date:
+        auto_note = "&nbsp;|&nbsp; ⚡ No dates found — auto-fetching <strong>last trading day</strong>"
+
+    st.markdown(f"""
+    <div class="success-box">
+    ✅ Parsed — <strong>{len(symbols)} rows</strong> × <strong>{len(dates_with_labels)} dates</strong>
+    {breakdown}
+    &nbsp;|&nbsp; Range: <strong>{min(date_objects).strftime('%d-%b-%Y')}</strong>
+    to <strong>{max(date_objects).strftime('%d-%b-%Y')}</strong>
+    {auto_note}
+    </div>
+    """, unsafe_allow_html=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Symbols detected:**")
+        st.write(", ".join(symbols))
+    with c2:
+        st.markdown("**Dates detected:**")
+        preview_dates = [d.strftime('%d-%b-%Y') for _, d in dates_with_labels[:12]]
+        suffix = f" … +{len(dates_with_labels)-12} more" if len(dates_with_labels) > 12 else ""
+        st.write(", ".join(preview_dates) + suffix)
+
+    st.markdown("---")
+
+    price_data, failed, failed_errors, holiday_fills = fetch_prices(
+        symbols, date_objects, fill_holidays=fill_holidays, adjusted=adjusted
     )
-    st.caption("Mix stocks and index names freely — the app auto-detects which is which.")
+    output_df = build_output(symbols, dates_with_labels, price_data)
 
-# ── FETCH BUTTON (always visible) ────────────────────────────
-fetch_clicked = st.button("🔄 Fetch Closing Prices", type="primary", use_container_width=True)
+    # Persist in session_state — survives Streamlit reruns (e.g. on download click)
+    st.session_state["output_df"]       = output_df
+    st.session_state["output_symbols"]  = symbols
+    st.session_state["output_dates"]    = dates_with_labels
+    st.session_state["holiday_fills"]   = holiday_fills
 
-# ── MAIN FLOW ────────────────────────────────────────────────
-if fetch_clicked:
-    if not raw_input.strip():
-        st.error("⚠️ Please paste your Symbol × Date table above before fetching.")
-    else:
-        symbols, dates_with_labels, unparsed = parse_input(raw_input)
+    total_cells  = len(symbols) * len(dates_with_labels)
+    filled_cells = output_df.iloc[:, 1:].notna().sum().sum()
+    holiday_note = f"&nbsp;|&nbsp; <strong>{len(holiday_fills)}</strong> holiday date(s) filled with prior close" if holiday_fills else ""
 
-        if symbols is None:
-            st.error(dates_with_labels)   # error string in second slot
+    st.markdown(f"""
+    <div class="success-box">
+    ✅ <strong>Complete</strong> &nbsp;|&nbsp;
+    <strong>{filled_cells:,}</strong> prices fetched &nbsp;|&nbsp;
+    <strong>{total_cells - filled_cells:,}</strong> blanks (holidays/weekends) &nbsp;|&nbsp;
+    <strong>{len(failed)}</strong> symbols failed
+    {holiday_note}
+    </div>
+    """, unsafe_allow_html=True)
+
+    if failed:
+        failed_lines = "<br>".join(
+            f"<strong>{s}</strong>: {failed_errors.get(s, 'unknown error')}" for s in failed
+        )
+        st.markdown(f'<div class="warn-box">⚠️ Failed symbols:<br>{failed_lines}</div>', unsafe_allow_html=True)
+
+    # Preview — cap at 15 columns for display only
+    st.markdown("### Preview")
+    preview_cols = ["Symbol"] + [orig for orig, _ in dates_with_labels[:15]]
+    # Use renamed df if holiday fills exist (so * shows in preview too)
+    preview_df = output_df.copy()
+    if holiday_fills and dates_with_labels:
+        preview_df = preview_df.rename(columns={
+            orig: orig + "*" for orig, dt in dates_with_labels if dt in holiday_fills
+        })
+        preview_cols = [c + "*" if c in {orig for orig, dt in dates_with_labels if dt in holiday_fills} else c
+                        for c in preview_cols]
+
+    st.dataframe(
+        preview_df[[c for c in preview_cols if c in preview_df.columns]].style.format(
+            {col: "{:,.2f}" for col in preview_cols[1:] if col in preview_df.columns},
+            na_rep="—"
+        ),
+        use_container_width=True,
+        height=min(400, (len(symbols) + 1) * 38),
+    )
+    if len(dates_with_labels) > 15:
+        st.caption(f"Showing 15 of {len(dates_with_labels)} date columns. All {len(dates_with_labels)} columns included in the Excel download.")
+
+    # Download — read from session_state to survive reruns
+    dl_df    = st.session_state.get("output_df", output_df)
+    dl_dates = st.session_state.get("output_dates", dates_with_labels)
+    dl_syms  = st.session_state.get("output_symbols", symbols)
+    dl_hf    = st.session_state.get("holiday_fills", holiday_fills)
+
+    price_label = "Adjusted" if adjusted else "Unadjusted"
+    st.download_button(
+        label=f"⬇️ Download — {len(dl_syms)} stocks × {len(dl_dates)} dates ({price_label}) Excel",
+        data=to_excel(dl_df, holiday_fills=dl_hf, dates_with_labels=dl_dates),
+        file_name=f"Bhavcopy_{datetime.today().strftime('%d%b%Y')}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
+
+
+# ── GLOBAL OPTIONS ───────────────────────────────────────────
+st.markdown("### Options")
+opt_col1, opt_col2 = st.columns(2)
+with opt_col1:
+    fill_holidays = st.checkbox(
+        "Fill holidays with prior trading day close",
+        value=False,
+        help="When on, holiday/weekend cells show the nearest prior trading day's close, marked * in Excel. When off, they show blank."
+    )
+with opt_col2:
+    price_type = st.radio(
+        "Price type",
+        ["Unadjusted (default)", "Adjusted (split/dividend)"],
+        horizontal=True,
+        help="Unadjusted = raw exchange close. Adjusted = corrected for splits and dividends."
+    )
+    adjusted = price_type.startswith("Adjusted")
+
+st.markdown("---")
+
+# ── INPUT TABS ───────────────────────────────────────────────
+tab_matrix, tab_quick = st.tabs(["📋 Matrix Mode — Paste from Excel", "⚡ Quick Fetch — Type symbols"])
+
+# ════════════════════════════════════════════════════════════
+# TAB 1 — MATRIX MODE
+# ════════════════════════════════════════════════════════════
+with tab_matrix:
+    st.markdown('<div class="info-box">Copy your Symbol × Date table from Excel and paste below. First column = stock/index names, first row = dates. Leave price cells empty.<br>💡 <strong>No dates?</strong> Just paste symbol names — the app will fetch last trading day automatically.</div>', unsafe_allow_html=True)
+
+    raw_input = st.text_area(
+        label="Paste here",
+        height=220,
+        placeholder="Symbol\t29-Sep-25\t02-Nov-25\t17-Apr-26\nRELIANCE\t\t\t\nINFY\t\t\t\nNIFTY50\t\t\t",
+        label_visibility="collapsed",
+        key="raw_input_area"
+    )
+    # Persist full input across reruns to prevent browser truncation
+    if raw_input:
+        st.session_state["last_raw_input"] = raw_input
+    raw_input = st.session_state.get("last_raw_input", raw_input)
+
+    fetch_matrix = st.button("🔄 Fetch Closing Prices", type="primary",
+                              use_container_width=True, key="btn_matrix")
+
+    if fetch_matrix:
+        if not raw_input.strip():
+            st.error("⚠️ Paste your table above before fetching.")
         else:
-            date_objects = [d for _, d in dates_with_labels]
+            result = parse_input(raw_input)
+            if result[0] is None:
+                st.error(result[1])
+            else:
+                symbols, dates_with_labels, unparsed, auto_date = result
+                if unparsed:
+                    st.markdown(f'<div class="warn-box">⚠️ Skipped unrecognised date values: {", ".join(unparsed)}</div>', unsafe_allow_html=True)
+                run_fetch_and_display(symbols, dates_with_labels, fill_holidays, adjusted, auto_date)
 
-            index_syms = [s for s in symbols if is_index(s)]
-            stock_syms = [s for s in symbols if not is_index(s)]
-            breakdown = ""
-            if index_syms:
-                breakdown = f"&nbsp;|&nbsp; <strong>{len(stock_syms)}</strong> stocks + <strong>{len(index_syms)}</strong> indexes"
+    elif raw_input.strip():
+        # Live parse preview before fetch
+        result = parse_input(raw_input)
+        if result[0] is None:
+            st.error(result[1])
+        else:
+            symbols, dates_with_labels, unparsed, auto_date = result
+            date_objects = [d for _, d in dates_with_labels]
+            index_syms   = [s for s in symbols if is_index(s)]
+            stock_syms   = [s for s in symbols if not is_index(s)]
+            breakdown    = f"&nbsp;|&nbsp; <strong>{len(stock_syms)}</strong> stocks + <strong>{len(index_syms)}</strong> indexes" if index_syms else ""
+            auto_note    = "&nbsp;|&nbsp; ⚡ No dates found — will fetch <strong>last trading day</strong>" if auto_date else ""
 
             st.markdown(f"""
             <div class="success-box">
@@ -501,95 +739,103 @@ if fetch_clicked:
             {breakdown}
             &nbsp;|&nbsp; Range: <strong>{min(date_objects).strftime('%d-%b-%Y')}</strong>
             to <strong>{max(date_objects).strftime('%d-%b-%Y')}</strong>
+            {auto_note}
+            &nbsp;|&nbsp; Ready — click <strong>Fetch Closing Prices</strong> above.
             </div>
             """, unsafe_allow_html=True)
-
             if unparsed:
                 st.markdown(f'<div class="warn-box">⚠️ Skipped unrecognised date values: {", ".join(unparsed)}</div>', unsafe_allow_html=True)
 
-            # Preview parsed inputs
-            c1, c2 = st.columns(2)
-            with c1:
-                st.markdown("**Symbols detected:**")
-                st.write(", ".join(symbols))
-            with c2:
-                st.markdown("**Dates detected:**")
-                preview_dates = [d.strftime('%d-%b-%Y') for _, d in dates_with_labels[:12]]
-                suffix = f" … +{len(dates_with_labels)-12} more" if len(dates_with_labels) > 12 else ""
-                st.write(", ".join(preview_dates) + suffix)
+    with st.expander("📊 See example input format", expanded=False):
+        st.dataframe(
+            pd.DataFrame({
+                "Symbol":    ["RELIANCE","INFY","NIFTY50","SENSEX","BANKNIFTY"],
+                "29-Sep-25": [""]*5,
+                "02-Nov-25": [""]*5,
+                "17-Apr-26": [""]*5,
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.caption("Mix stocks and index names freely. Copy this table structure from Excel.")
 
-            st.markdown("---")
 
-            price_data, failed, failed_errors = fetch_prices(symbols, date_objects)
-            output_df = build_output(symbols, dates_with_labels, price_data)
+# ════════════════════════════════════════════════════════════
+# TAB 2 — QUICK FETCH
+# ════════════════════════════════════════════════════════════
+with tab_quick:
+    st.markdown('<div class="info-box">Type stock/index names below. Choose your date option. No Excel needed.</div>', unsafe_allow_html=True)
 
-            total_cells  = len(symbols) * len(dates_with_labels)
-            filled_cells = output_df.iloc[:, 1:].notna().sum().sum()
+    qf_symbols_raw = st.text_area(
+        "Symbols (one per line or comma-separated)",
+        height=160,
+        placeholder="RELIANCE\nINFY\nHCLTECH\nNIFTY50\nSENSEX",
+        key="qf_symbols"
+    )
 
-            st.markdown(f"""
-            <div class="success-box">
-            ✅ <strong>Complete</strong> &nbsp;|&nbsp;
-            <strong>{filled_cells:,}</strong> prices fetched &nbsp;|&nbsp;
-            <strong>{total_cells - filled_cells:,}</strong> blanks (holidays / weekends) &nbsp;|&nbsp;
-            <strong>{len(failed)}</strong> symbols failed
-            </div>
-            """, unsafe_allow_html=True)
+    qf_date_mode = st.radio(
+        "Date",
+        ["Last trading day", "Specific dates", "Date range"],
+        horizontal=True,
+        key="qf_date_mode"
+    )
 
-            if failed:
-                failed_lines = "<br>".join(
-                    f"<strong>{s}</strong>: {failed_errors.get(s, 'unknown error')}" for s in failed
-                )
-                st.markdown(f'<div class="warn-box">⚠️ Failed symbols — check NSE ticker or try again:<br>{failed_lines}</div>', unsafe_allow_html=True)
+    qf_dates_with_labels = []
+    qf_date_error        = None
 
-            # Preview — cap at 15 date columns for display
-            st.markdown("### Preview")
-            preview_cols = ["Symbol"] + [orig for orig, _ in dates_with_labels[:15]]
-            st.dataframe(
-                output_df[preview_cols].style.format(
-                    {col: "{:,.2f}" for col in preview_cols[1:]},
-                    na_rep="—"
-                ),
-                use_container_width=True,
-                height=min(400, (len(symbols) + 1) * 38),
-            )
-            if len(dates_with_labels) > 15:
-                st.caption(f"Showing 15 of {len(dates_with_labels)} date columns. All {len(dates_with_labels)} columns included in the Excel download.")
+    if qf_date_mode == "Last trading day":
+        ltd = last_trading_day()
+        qf_dates_with_labels = [(ltd.strftime('%d-%b-%Y'), ltd)]
+        st.caption(f"Will fetch: **{ltd.strftime('%d-%b-%Y')}**")
 
-            # Download
-            st.download_button(
-                label=f"⬇️ Download Full Matrix — {len(symbols)} stocks × {len(dates_with_labels)} dates (Excel)",
-                data=to_excel(output_df),
-                file_name=f"Bhavcopy_{datetime.today().strftime('%d%b%Y')}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-                use_container_width=True,
-            )
+    elif qf_date_mode == "Specific dates":
+        qf_dates_raw = st.text_input(
+            "Dates (comma-separated, any format)",
+            placeholder="29-Sep-25, 02-Nov-25, 17-Apr-26",
+            key="qf_dates_specific"
+        )
+        if qf_dates_raw.strip():
+            for part in qf_dates_raw.replace('\n', ',').split(','):
+                part = part.strip()
+                if part:
+                    d = parse_date_flexible(part)
+                    if d:
+                        qf_dates_with_labels.append((part, d))
+                    else:
+                        st.warning(f"Could not parse date: `{part}` — skipped")
+        if not qf_dates_with_labels and qf_dates_raw.strip():
+            qf_date_error = "No valid dates found. Check format (29-Sep-25, 29/09/2025, 2025-09-29 all work)."
 
-elif raw_input.strip():
-    # Input pasted but not yet fetched — show live parse preview
-    symbols, dates_with_labels, unparsed = parse_input(raw_input)
-    if symbols is None:
-        st.error(dates_with_labels)
-    else:
-        date_objects = [d for _, d in dates_with_labels]
-        index_syms = [s for s in symbols if is_index(s)]
-        stock_syms = [s for s in symbols if not is_index(s)]
-        breakdown = ""
-        if index_syms:
-            breakdown = f"&nbsp;|&nbsp; <strong>{len(stock_syms)}</strong> stocks + <strong>{len(index_syms)}</strong> indexes"
+    elif qf_date_mode == "Date range":
+        col_from, col_to = st.columns(2)
+        with col_from:
+            qf_start = st.date_input("From", value=date.today() - timedelta(days=30), key="qf_range_start")
+        with col_to:
+            qf_end = st.date_input("To", value=last_trading_day(), key="qf_range_end")
 
-        st.markdown(f"""
-        <div class="success-box">
-        ✅ Parsed — <strong>{len(symbols)} rows</strong> × <strong>{len(dates_with_labels)} dates</strong>
-        {breakdown}
-        &nbsp;|&nbsp; Range: <strong>{min(date_objects).strftime('%d-%b-%Y')}</strong>
-        to <strong>{max(date_objects).strftime('%d-%b-%Y')}</strong>
-        &nbsp;|&nbsp; Ready — click <strong>Fetch Closing Prices</strong> above.
-        </div>
-        """, unsafe_allow_html=True)
-        if unparsed:
-            st.markdown(f'<div class="warn-box">⚠️ Skipped unrecognised date values: {", ".join(unparsed)}</div>', unsafe_allow_html=True)
+        if qf_start and qf_end:
+            if qf_end < qf_start:
+                qf_date_error = "End date must be after start date."
+            else:
+                bdays = pd.bdate_range(start=qf_start, end=qf_end)
+                qf_dates_with_labels = [(d.strftime('%d-%b-%Y'), d.date()) for d in bdays]
+                st.caption(f"Will fetch **{len(qf_dates_with_labels)} trading days** ({qf_start.strftime('%d-%b-%Y')} → {qf_end.strftime('%d-%b-%Y')})")
+
+    fetch_quick = st.button("🔄 Fetch Closing Prices", type="primary",
+                             use_container_width=True, key="btn_quick")
+
+    if fetch_quick:
+        qf_symbols = parse_quick_symbols(qf_symbols_raw)
+        if not qf_symbols:
+            st.error("⚠️ Enter at least one symbol above.")
+        elif qf_date_error:
+            st.error(f"⚠️ {qf_date_error}")
+        elif not qf_dates_with_labels:
+            st.error("⚠️ Select or enter at least one date.")
+        else:
+            run_fetch_and_display(qf_symbols, qf_dates_with_labels, fill_holidays, adjusted, auto_date=False)
+
 
 # ── FOOTER ───────────────────────────────────────────────────
 st.markdown("---")
-st.caption("Bhavcopy v1.1  |  NSE stocks + NSE/BSE indexes via Yahoo Finance (unadjusted)  |  Blanks = market holiday or weekend  |  Built for Motilal Oswal Research")
+st.caption("Bhavcopy v1.3  |  NSE stocks + NSE/BSE indexes via Yahoo Finance (unadjusted by default)  |  Blanks = market holiday or weekend  |  Built for Motilal Oswal Research")
