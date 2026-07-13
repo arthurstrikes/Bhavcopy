@@ -690,7 +690,7 @@ if not nav_series:
 # ── GLITCH WARNINGS ───────────────────────────────────────────────────────────
 if glitch_log:
     with st.expander(f"⚠️ {len(glitch_log)} zero-price glitch(es) detected — EOD prices substituted"):
-        st.dataframe(pd.DataFrame(glitch_log), width='stretch', hide_index=True)
+        st.dataframe(pd.DataFrame(glitch_log), use_container_width=True, hide_index=True)
 
 # ── BUILD DATAFRAMES ──────────────────────────────────────────────────────────
 nav_df = pd.DataFrame([{
@@ -790,7 +790,7 @@ fig.update_layout(
     paper_bgcolor="white",
     margin=dict(l=50, r=20, t=60, b=40),
 )
-st.plotly_chart(fig, width='stretch')
+st.plotly_chart(fig, use_container_width=True)
 
 # ── HOLDINGS + SUMMARY ────────────────────────────────────────────────────────
 col_h, col_s = st.columns([3, 2])
@@ -808,7 +808,7 @@ with col_h:
             "Wt %":  round(actual_wt, 2),
         })
     if holdings_data:
-        st.dataframe(pd.DataFrame(holdings_data), width='stretch', hide_index=True)
+        st.dataframe(pd.DataFrame(holdings_data), use_container_width=True, hide_index=True)
     else:
         st.info("No open positions on this date.")
 
@@ -831,7 +831,7 @@ with col_s:
         "Active Stocks":   str(len(last_row["holdings"])),
     }
     sum_df = pd.DataFrame(list(summary.items()), columns=["Metric", "Value"])
-    st.dataframe(sum_df, width='stretch', hide_index=True, height=440)
+    st.dataframe(sum_df, use_container_width=True, hide_index=True, height=440)
 
 # ── DAILY NAV TABLE ───────────────────────────────────────────────────────────
 st.markdown("---")
@@ -854,7 +854,7 @@ disp_df = disp_df.iloc[::-1].reset_index(drop=True)
 
 st.dataframe(
     disp_df,
-    width='stretch',
+    use_container_width=True,
     hide_index=True,
     height=420,
     column_config={
