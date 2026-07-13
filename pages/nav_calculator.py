@@ -527,7 +527,7 @@ with st.sidebar:
         type=["csv", "xlsx", "xls"],
         help="CSV (pipe-delimited default download) or XLSX/XLS",
     )
-    run_btn = st.button("▶ Calculate NAV", type="primary", width='stretch',
+    run_btn = st.button("▶ Calculate NAV", type="primary", use_container_width=True,
                         disabled=uploaded is None)
 
     st.markdown("---")
@@ -884,7 +884,7 @@ with ex1:
         data=excel_bytes,
         file_name=f"NAV_{uploaded.name.split('.')[0]}_{to_date.strftime('%d%b%Y')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        width='stretch',
+        use_container_width=True,
         type="primary",
     )
 
@@ -895,6 +895,6 @@ with ex2:
         data=csv_bytes,
         file_name=f"NAV_{uploaded.name.split('.')[0]}_{to_date.strftime('%d%b%Y')}.csv",
         mime="text/csv",
-        width='stretch',
+        use_container_width=True,
     )
 
