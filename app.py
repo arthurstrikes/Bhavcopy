@@ -640,7 +640,7 @@ def run_fetch_and_display(symbols, dates_with_labels, fill_holidays, adjusted, a
             {col: "{:,.2f}" for col in preview_cols[1:] if col in preview_df.columns},
             na_rep="—"
         ),
-        width='stretch',
+        use_container_width=True,
         height=min(400, (len(symbols) + 1) * 38),
     )
     if len(dates_with_labels) > 15:
@@ -754,7 +754,7 @@ with tab_matrix:
                 "02-Nov-25": [""]*5,
                 "17-Apr-26": [""]*5,
             }),
-            width='stretch',
+            use_container_width=True,
             hide_index=True,
         )
         st.caption("Mix stocks and index names freely. Copy this table structure from Excel.")
