@@ -1,4 +1,4 @@
-import streamlit as st
+  import streamlit as st
 import pandas as pd
 import yfinance as yf
 from io import BytesIO
@@ -659,7 +659,7 @@ def run_fetch_and_display(symbols, dates_with_labels, fill_holidays, adjusted, a
         file_name=f"Bhavcopy_{datetime.today().strftime('%d%b%Y')}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
-        width='stretch',
+        use_container_width=True,
     )
 
 
@@ -705,7 +705,7 @@ with tab_matrix:
     raw_input = st.session_state.get("last_raw_input", raw_input)
 
     fetch_matrix = st.button("🔄 Fetch Closing Prices", type="primary",
-                              width='stretch', key="btn_matrix")
+                              use_container_width=True, key="btn_matrix")
 
     if fetch_matrix:
         if not raw_input.strip():
@@ -822,7 +822,7 @@ with tab_quick:
                 st.caption(f"Will fetch **{len(qf_dates_with_labels)} trading days** ({qf_start.strftime('%d-%b-%Y')} → {qf_end.strftime('%d-%b-%Y')})")
 
     fetch_quick = st.button("🔄 Fetch Closing Prices", type="primary",
-                             width='stretch', key="btn_quick")
+                             use_container_width=True, key="btn_quick")
 
     if fetch_quick:
         qf_symbols = parse_quick_symbols(qf_symbols_raw)
@@ -839,3 +839,4 @@ with tab_quick:
 # ── FOOTER ───────────────────────────────────────────────────
 st.markdown("---")
 st.caption("Bhavcopy v1.3  |  NSE stocks + NSE/BSE indexes via Yahoo Finance (unadjusted by default)  |  Blanks = market holiday or weekend  |  Built for Motilal Oswal Research")
+
