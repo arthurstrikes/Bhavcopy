@@ -370,7 +370,10 @@ RETRY_DELAY   = 4
 REQUEST_DELAY = 0.5
 
 def fetch_single(ticker, fetch_start, fetch_end, adjusted=False):
-    """Download data for one ticker with retries. Returns DataFrame or raises."""
+    """Download data for one ticker with retries. Returns DataFrame or raises.
+    Uses longer exponential backoff specifically for rate-limit errors,
+    since Yahoo's 429 needs real cooldown time — a flat short delay just
+    retries straight into the same throttle window."""
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             df = yf.download(
@@ -387,8 +390,10 @@ def fetch_single(ticker, fetch_start, fetch_end, adjusted=False):
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY)
         except Exception as e:
+            is_rate_limit = "rate" in str(e).lower() or "429" in str(e) or "too many requests" in str(e).lower()
             if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY)
+                delay = RETRY_DELAY * (4 ** attempt) if is_rate_limit else RETRY_DELAY
+                time.sleep(delay)
             else:
                 raise e
     return pd.DataFrame()
@@ -415,15 +420,22 @@ def _extract_close_series(df, ticker, is_multi):
     return out
 
 
+@st.cache_data(show_spinner=False, ttl=3600)
 def fetch_prices(symbols, date_objects, fill_holidays=False, adjusted=False):
     """
     Returns: results, failed, failed_errors, holiday_fills
     holiday_fills: set of date objects where prior-day fill was applied.
 
+    Cached for 1 hour — avoids re-hitting Yahoo Finance on every Streamlit
+    rerun (button clicks, widget changes) with the same symbols/dates, which
+    was compounding rate-limit risk on top of the batch fetch below.
+
     Batches all symbols into a single yf.download() call (one HTTP round-trip
     instead of one per symbol) to cut fetch time. Any symbol missing/empty in
     the batch result is retried individually via fetch_single as a fallback
     (rare — bad ticker, delisted, unsupported index, etc.).
+
+    symbols and date_objects must be passed as tuples (hashable) for caching.
     """
     min_date = min(date_objects)
     max_date = max(date_objects)
@@ -651,7 +663,7 @@ def run_fetch_and_display(symbols, dates_with_labels, fill_holidays, adjusted, a
     st.markdown("---")
 
     price_data, failed, failed_errors, holiday_fills = fetch_prices(
-        symbols, date_objects, fill_holidays=fill_holidays, adjusted=adjusted
+        tuple(symbols), tuple(date_objects), fill_holidays=fill_holidays, adjusted=adjusted
     )
     output_df = build_output(symbols, dates_with_labels, price_data)
 
