@@ -191,55 +191,109 @@ def parse_log(uploaded_file) -> tuple[pd.DataFrame | None, str]:
 
 
 # ── YFINANCE PRICE FETCHER ────────────────────────────────────────────────────
+def _extract_symbol_prices(df: pd.DataFrame, ticker: str, is_multi: bool) -> dict:
+    """Pull {date: close_price} for one ticker out of a (possibly multi-ticker) df."""
+    prices = {}
+    if is_multi:
+        if ticker not in df.columns.get_level_values(0):
+            return prices
+        sub = df[ticker]
+        close_col = next((c for c in sub.columns if "close" in c.lower()), None)
+        if close_col is None:
+            return prices
+        series = sub[close_col]
+    else:
+        close_col = next((c for c in df.columns if "close" in c.lower()), None)
+        if close_col is None:
+            return prices
+        series = df[close_col]
+    for idx, v in series.items():
+        d = idx.date() if hasattr(idx, "date") else idx
+        v = float(v)
+        if not np.isnan(v):
+            prices[d] = v
+    return prices
+
+
+def _fetch_single(ticker: str, start: date, end: date) -> dict:
+    """Fallback single-ticker fetch with retries — used only for symbols the batch call missed.
+    Uses longer exponential backoff specifically for rate-limit errors, since
+    Yahoo's 429 needs real cooldown time — a flat short delay just retries
+    straight into the same throttle window."""
+    for attempt in range(1, YF_RETRIES + 1):
+        try:
+            df = yf.download(
+                ticker,
+                start=start - timedelta(days=5),
+                end=end + timedelta(days=2),
+                interval="1d",
+                progress=False,
+                auto_adjust=False,
+                actions=False,
+            )
+            if df.empty:
+                if attempt < YF_RETRIES:
+                    time.sleep(YF_DELAY)
+                continue
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            return _extract_symbol_prices(df, ticker, is_multi=False)
+        except Exception as e:
+            is_rate_limit = "rate" in str(e).lower() or "429" in str(e) or "too many requests" in str(e).lower()
+            if attempt < YF_RETRIES:
+                delay = YF_DELAY * (8 ** attempt) if is_rate_limit else YF_DELAY
+                time.sleep(delay)
+    return {}
+
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_eod_prices(symbols_tuple: tuple, start_str: str, end_str: str) -> dict:
     """
     Fetch EOD close prices for multiple symbols over a date range.
     Returns {symbol: {date: price}} dict.
     Cached for 1 hour.
+
+    Batches all symbols into a single yf.download() call (one HTTP round-trip
+    instead of one per symbol). Any symbol missing/empty in the batch result
+    is retried individually as a fallback (rare — bad ticker, delisted, etc.).
     """
     symbols = list(symbols_tuple)
     start   = datetime.strptime(start_str, "%Y-%m-%d").date()
     end     = datetime.strptime(end_str,   "%Y-%m-%d").date()
     result  = {}
 
-    for sym in symbols:
-        ticker = to_yf(sym)
-        for attempt in range(1, YF_RETRIES + 1):
-            try:
-                df = yf.download(
-                    ticker,
-                    start=start - timedelta(days=5),   # buffer for weekends
-                    end=end   + timedelta(days=2),
-                    interval="1d",
-                    progress=False,
-                    auto_adjust=False,
-                    actions=False,
-                )
-                if df.empty:
-                    if attempt < YF_RETRIES:
-                        time.sleep(YF_DELAY * 2)
-                    continue
-                # Flatten MultiIndex if present
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                close_col = next((c for c in df.columns if "close" in c.lower()), None)
-                if close_col is None:
-                    break
-                prices = {}
-                for idx, row in df.iterrows():
-                    d = idx.date() if hasattr(idx, "date") else idx
-                    v = float(row[close_col])
-                    if not np.isnan(v):
-                        prices[d] = v
-                result[sym] = prices
-                break
-            except Exception:
-                if attempt < YF_RETRIES:
-                    time.sleep(YF_DELAY * 2)
-        if sym not in result:
-            result[sym] = {}
-        time.sleep(YF_DELAY)
+    sym_to_ticker = {sym: to_yf(sym) for sym in symbols}
+    tickers = list(sym_to_ticker.values())
+
+    batch_df = None
+    try:
+        batch_df = yf.download(
+            tickers,
+            start=start - timedelta(days=5),
+            end=end + timedelta(days=2),
+            interval="1d",
+            progress=False,
+            auto_adjust=False,
+            actions=False,
+            group_by="ticker",
+            threads=True,
+        )
+    except Exception:
+        batch_df = None
+
+    is_multi = isinstance(batch_df.columns, pd.MultiIndex) if batch_df is not None else False
+
+    for sym, ticker in sym_to_ticker.items():
+        prices = {}
+        if batch_df is not None and not batch_df.empty:
+            if len(tickers) == 1 and not is_multi:
+                prices = _extract_symbol_prices(batch_df, ticker, is_multi=False)
+            else:
+                prices = _extract_symbol_prices(batch_df, ticker, is_multi=True)
+        if not prices:
+            # Fallback: batch missed this symbol entirely — retry individually
+            prices = _fetch_single(ticker, start, end)
+        result[sym] = prices
 
     return result
 
