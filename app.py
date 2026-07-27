@@ -394,10 +394,36 @@ def fetch_single(ticker, fetch_start, fetch_end, adjusted=False):
     return pd.DataFrame()
 
 
+def _extract_close_series(df, ticker, is_multi):
+    """Pull a Close-price Series (indexed by date) for one ticker out of a (possibly multi-ticker) df."""
+    if is_multi:
+        if ticker not in df.columns.get_level_values(0):
+            return None
+        sub = df[ticker]
+        if "Close" not in sub.columns:
+            return None
+        series = sub["Close"]
+    else:
+        if "Close" not in df.columns:
+            return None
+        series = df["Close"]
+    series = series.dropna()
+    if series.empty:
+        return None
+    out = series.copy()
+    out.index = pd.to_datetime(out.index).date
+    return out
+
+
 def fetch_prices(symbols, date_objects, fill_holidays=False, adjusted=False):
     """
     Returns: results, failed, failed_errors, holiday_fills
     holiday_fills: set of date objects where prior-day fill was applied.
+
+    Batches all symbols into a single yf.download() call (one HTTP round-trip
+    instead of one per symbol) to cut fetch time. Any symbol missing/empty in
+    the batch result is retried individually via fetch_single as a fallback
+    (rare — bad ticker, delisted, unsupported index, etc.).
     """
     min_date = min(date_objects)
     max_date = max(date_objects)
@@ -410,15 +436,50 @@ def fetch_prices(symbols, date_objects, fill_holidays=False, adjusted=False):
     failed_errors = {}
     holiday_fills = set()   # dates where prior-day fill was applied
 
-    progress = st.progress(0, text="Starting…")
     total = len(symbols)
+    progress = st.progress(0, text=f"Fetching {total} symbol(s)…")
+
+    sym_to_ticker = {sym: to_yf_ticker(sym) for sym in symbols}
+    tickers = list(sym_to_ticker.values())
+
+    batch_df = None
+    try:
+        batch_df = yf.download(
+            tickers,
+            start=fetch_start,
+            end=fetch_end,
+            interval="1d",
+            progress=False,
+            auto_adjust=adjusted,
+            actions=False,
+            group_by="ticker",
+            threads=True,
+        )
+    except Exception:
+        batch_df = None
+
+    is_multi = isinstance(batch_df.columns, pd.MultiIndex) if batch_df is not None else False
 
     for i, symbol in enumerate(symbols):
-        progress.progress(int(i / total * 100), text=f"Fetching {symbol}  ({i+1} of {total})")
-        ticker = to_yf_ticker(symbol)
+        progress.progress(int((i + 1) / total * 100), text=f"Processing {symbol}  ({i+1} of {total})")
+        ticker = sym_to_ticker[symbol]
 
-        try:
-            df = fetch_single(ticker, fetch_start, fetch_end, adjusted=adjusted)
+        close_series = None
+        if batch_df is not None and not batch_df.empty:
+            if len(tickers) == 1 and not is_multi:
+                close_series = _extract_close_series(batch_df, ticker, is_multi=False)
+            else:
+                close_series = _extract_close_series(batch_df, ticker, is_multi=True)
+
+        if close_series is None:
+            # Fallback: batch missed this symbol entirely — retry individually
+            try:
+                df = fetch_single(ticker, fetch_start, fetch_end, adjusted=adjusted)
+            except Exception as e:
+                failed.append(symbol)
+                failed_errors[symbol] = str(e)[:120]
+                results[symbol] = {}
+                continue
 
             if df.empty:
                 failed.append(symbol)
@@ -433,43 +494,40 @@ def fetch_prices(symbols, date_objects, fill_holidays=False, adjusted=False):
                 else:
                     failed_errors[symbol] = f"No data returned for {ticker} — verify NSE ticker"
                 results[symbol] = {}
-                time.sleep(REQUEST_DELAY)
                 continue
 
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-
             df.index = pd.to_datetime(df.index).date
-            close_map = {}
+            close_lookup = df["Close"]
+        else:
+            close_lookup = close_series
 
-            for dt in date_objects:
-                if dt in df.index:
-                    val = df.loc[dt, "Close"]
-                    close_map[dt] = round(float(val), 2) if pd.notna(val) else None
-                elif fill_holidays:
-                    # Walk back up to 7 days to find nearest prior trading day
-                    filled = False
-                    for days_back in range(1, 8):
-                        prior = dt - timedelta(days=days_back)
-                        if prior in df.index:
-                            val = df.loc[prior, "Close"]
-                            close_map[dt] = round(float(val), 2) if pd.notna(val) else None
-                            holiday_fills.add(dt)
-                            filled = True
-                            break
-                    if not filled:
-                        close_map[dt] = None
-                else:
-                    close_map[dt] = None   # holiday/weekend → blank
+        close_map = {}
+        for dt in date_objects:
+            if dt in close_lookup.index:
+                val = close_lookup.loc[dt]
+                if isinstance(val, pd.Series):
+                    val = val.iloc[0]
+                close_map[dt] = round(float(val), 2) if pd.notna(val) else None
+            elif fill_holidays:
+                filled = False
+                for days_back in range(1, 8):
+                    prior = dt - timedelta(days=days_back)
+                    if prior in close_lookup.index:
+                        val = close_lookup.loc[prior]
+                        if isinstance(val, pd.Series):
+                            val = val.iloc[0]
+                        close_map[dt] = round(float(val), 2) if pd.notna(val) else None
+                        holiday_fills.add(dt)
+                        filled = True
+                        break
+                if not filled:
+                    close_map[dt] = None
+            else:
+                close_map[dt] = None   # holiday/weekend → blank
 
-            results[symbol] = close_map
-
-        except Exception as e:
-            failed.append(symbol)
-            failed_errors[symbol] = str(e)[:120]
-            results[symbol] = {}
-
-        time.sleep(REQUEST_DELAY)
+        results[symbol] = close_map
 
     progress.progress(100, text="Done!")
     return results, failed, failed_errors, holiday_fills
