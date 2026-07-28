@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+import nse_bhavcopy
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
@@ -651,49 +652,45 @@ active_syms = sorted(log_df[log_df["exit_date"] <= to_date]["symbol"].unique().t
 fetch_start = (inception_date - timedelta(days=5)).strftime("%Y-%m-%d")
 fetch_end   = (to_date + timedelta(days=2)).strftime("%Y-%m-%d")
 
-with st.spinner(f"Fetching EOD prices for {len(active_syms)} symbols from Yahoo Finance..."):
-    progress_bar = st.progress(0, text="Starting price fetch...")
+with st.spinner(f"Fetching EOD prices for {len(active_syms)} symbols..."):
+    progress_bar = st.progress(0, text="Fetching NSE bhavcopy...")
     eod_prices   = {}
+    fetch_reasons = {}
 
-    for i, sym in enumerate(active_syms):
+    inc = (inception_date - timedelta(days=5))
+    end_ = (to_date + timedelta(days=2))
+    trading_dates = [
+        d for d in (inc + timedelta(days=k) for k in range((end_ - inc).days + 1))
+        if d.weekday() < 5
+    ]
+
+    def _cb(done, total, d):
         progress_bar.progress(
-            (i + 1) / len(active_syms),
-            text=f"Fetching {sym} ({i+1}/{len(active_syms)})..."
+            min(done / max(total, 1), 1.0),
+            text=f"NSE bhavcopy {done}/{total} dates ({d})..."
         )
-        ticker = to_yf(sym)
-        try:
-            df = yf.download(
-                ticker,
-                start=fetch_start,
-                end=fetch_end,
-                interval="1d",
-                progress=False,
-                auto_adjust=False,
-                actions=False,
-            )
-            if not df.empty:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                close_col = next((c for c in df.columns if "close" in c.lower()), None)
-                if close_col:
-                    prices = {}
-                    for idx, row in df.iterrows():
-                        d = idx.date() if hasattr(idx, "date") else idx
-                        v = row[close_col]
-                        try:
-                            fv = float(v)
-                            if not np.isnan(fv):
-                                prices[d] = fv
-                        except:
-                            pass
-                    eod_prices[sym] = prices
-                else:
-                    eod_prices[sym] = {}
-            else:
-                eod_prices[sym] = {}
-        except Exception as e:
-            eod_prices[sym] = {}
-        time.sleep(YF_DELAY)
+
+    try:
+        bc_results, bc_failed, bc_errors, _ = nse_bhavcopy.fetch_closes(
+            active_syms, trading_dates, fill_holidays=False, progress_cb=_cb
+        )
+    except Exception as e:
+        bc_results, bc_failed, bc_errors = {}, list(active_syms), {
+            s: f"NSE archive unavailable: {str(e)[:100]}" for s in active_syms
+        }
+
+    for sym in active_syms:
+        prices = {d: v for d, v in bc_results.get(sym, {}).items() if v is not None}
+        if not prices:
+            # Fallback: NSE bhavcopy missed this symbol entirely — try yfinance
+            ticker = to_yf(sym)
+            prices = _fetch_single(ticker, inception_date, to_date)
+            if prices:
+                fetch_reasons[sym] = "via Yahoo Finance fallback"
+            elif sym in bc_errors:
+                fetch_reasons[sym] = bc_errors[sym]
+        eod_prices[sym] = prices
+        time.sleep(0)  # no-op, kept so any downstream timing assumptions are unaffected
 
     progress_bar.empty()
 
@@ -702,10 +699,14 @@ fetch_ok   = [s for s in active_syms if eod_prices.get(s)]
 fetch_fail = [s for s in active_syms if not eod_prices.get(s)]
 
 if fetch_fail:
+    reason_lines = "<br>".join(
+        f"&nbsp;&nbsp;• <strong>{s}</strong>: {fetch_reasons.get(s, 'no data returned')}"
+        for s in fetch_fail
+    )
     st.markdown(f"""
     <div class="warn">
-    ⚠️ Price fetch failed for <strong>{len(fetch_fail)}</strong> symbol(s):
-    {", ".join(fetch_fail)}<br>
+    ⚠️ Price fetch failed for <strong>{len(fetch_fail)}</strong> symbol(s):<br>
+    {reason_lines}<br>
     These will use log prices / carry-forward on non-trade days.
     </div>
     """, unsafe_allow_html=True)
@@ -714,24 +715,37 @@ if fetch_fail:
 bench_prices = {}
 if benchmark != "None":
     bench_ticker = BENCH_MAP[benchmark]
-    try:
-        df = yf.download(bench_ticker, start=fetch_start, end=fetch_end,
-                         interval="1d", progress=False, auto_adjust=False, actions=False)
-        if not df.empty:
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            close_col = next((c for c in df.columns if "close" in c.lower()), None)
-            if close_col:
-                for idx, row in df.iterrows():
-                    d = idx.date() if hasattr(idx, "date") else idx
-                    try:
-                        v = float(row[close_col])
-                        if not np.isnan(v):
-                            bench_prices[d] = v
-                    except:
-                        pass
-    except:
-        pass
+    is_nse_index = benchmark in ("Nifty 50", "Nifty 500")
+
+    if is_nse_index:
+        try:
+            bc_bench, bc_bench_failed, _, _ = nse_bhavcopy.fetch_closes(
+                [benchmark], trading_dates, fill_holidays=False
+            )
+            bench_prices = {d: v for d, v in bc_bench.get(benchmark, {}).items() if v is not None}
+        except Exception:
+            bench_prices = {}
+
+    if not bench_prices:
+        # Fallback: Sensex (BSE, not in NSE bhavcopy) or bhavcopy miss for Nifty
+        try:
+            df = yf.download(bench_ticker, start=fetch_start, end=fetch_end,
+                             interval="1d", progress=False, auto_adjust=False, actions=False)
+            if not df.empty:
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                close_col = next((c for c in df.columns if "close" in c.lower()), None)
+                if close_col:
+                    for idx, row in df.iterrows():
+                        d = idx.date() if hasattr(idx, "date") else idx
+                        try:
+                            v = float(row[close_col])
+                            if not np.isnan(v):
+                                bench_prices[d] = v
+                        except:
+                            pass
+        except:
+            pass
 
 # ── RUN NAV ENGINE ────────────────────────────────────────────────────────────
 with st.spinner("Computing daily NAV..."):
