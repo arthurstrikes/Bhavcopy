@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
+import nse_bhavcopy
 from io import BytesIO
 from datetime import datetime, timedelta, date
 import time
@@ -421,70 +422,41 @@ def _extract_close_series(df, ticker, is_multi):
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def fetch_prices(symbols, date_objects, fill_holidays=False, adjusted=False):
+def _fetch_prices_yf(symbols, date_objects, fill_holidays=False, adjusted=False):
     """
-    Returns: results, failed, failed_errors, holiday_fills
-    holiday_fills: set of date objects where prior-day fill was applied.
-
-    Cached for 1 hour — avoids re-hitting Yahoo Finance on every Streamlit
-    rerun (button clicks, widget changes) with the same symbols/dates, which
-    was compounding rate-limit risk on top of the batch fetch below.
-
-    Batches all symbols into a single yf.download() call (one HTTP round-trip
-    instead of one per symbol) to cut fetch time. Any symbol missing/empty in
-    the batch result is retried individually via fetch_single as a fallback
-    (rare — bad ticker, delisted, unsupported index, etc.).
-
-    symbols and date_objects must be passed as tuples (hashable) for caching.
+    Legacy yfinance path. Retained only as a fallback for symbols the NSE
+    bhavcopy cannot resolve (e.g. BSE-only scrips). Yahoo rate-limits shared
+    cloud IPs, so this is no longer the primary source.
     """
-    min_date = min(date_objects)
-    max_date = max(date_objects)
-
+    min_date, max_date = min(date_objects), max(date_objects)
     fetch_start = (min_date - timedelta(days=10)).strftime("%Y-%m-%d")
     fetch_end   = (max_date + timedelta(days=12)).strftime("%Y-%m-%d")
 
-    results       = {}
-    failed        = []
-    failed_errors = {}
-    holiday_fills = set()   # dates where prior-day fill was applied
-
-    total = len(symbols)
-    progress = st.progress(0, text=f"Fetching {total} symbol(s)…")
-
+    results, failed, failed_errors, holiday_fills = {}, [], {}, set()
     sym_to_ticker = {sym: to_yf_ticker(sym) for sym in symbols}
     tickers = list(sym_to_ticker.values())
 
     batch_df = None
     try:
         batch_df = yf.download(
-            tickers,
-            start=fetch_start,
-            end=fetch_end,
-            interval="1d",
-            progress=False,
-            auto_adjust=adjusted,
-            actions=False,
-            group_by="ticker",
-            threads=True,
+            tickers, start=fetch_start, end=fetch_end, interval="1d",
+            progress=False, auto_adjust=adjusted, actions=False,
+            group_by="ticker", threads=True,
         )
     except Exception:
         batch_df = None
 
     is_multi = isinstance(batch_df.columns, pd.MultiIndex) if batch_df is not None else False
 
-    for i, symbol in enumerate(symbols):
-        progress.progress(int((i + 1) / total * 100), text=f"Processing {symbol}  ({i+1} of {total})")
+    for symbol in symbols:
         ticker = sym_to_ticker[symbol]
-
         close_series = None
         if batch_df is not None and not batch_df.empty:
-            if len(tickers) == 1 and not is_multi:
-                close_series = _extract_close_series(batch_df, ticker, is_multi=False)
-            else:
-                close_series = _extract_close_series(batch_df, ticker, is_multi=True)
+            close_series = _extract_close_series(
+                batch_df, ticker, is_multi=not (len(tickers) == 1 and not is_multi)
+            )
 
         if close_series is None:
-            # Fallback: batch missed this symbol entirely — retry individually
             try:
                 df = fetch_single(ticker, fetch_start, fetch_end, adjusted=adjusted)
             except Exception as e:
@@ -492,22 +464,11 @@ def fetch_prices(symbols, date_objects, fill_holidays=False, adjusted=False):
                 failed_errors[symbol] = str(e)[:120]
                 results[symbol] = {}
                 continue
-
             if df.empty:
                 failed.append(symbol)
-                if symbol.upper() in YF_UNSUPPORTED_INDICES:
-                    failed_errors[symbol] = (
-                        "Not available via Yahoo Finance — download historical data manually from "
-                        "NSE India (nseindia.com → Reports → Index Historical Data) "
-                        "and paste closes into your Excel"
-                    )
-                elif is_index(symbol):
-                    failed_errors[symbol] = f"No data for index {ticker} — may not be available on Yahoo Finance for this date range"
-                else:
-                    failed_errors[symbol] = f"No data returned for {ticker} — verify NSE ticker"
+                failed_errors[symbol] = f"No data returned for {ticker}"
                 results[symbol] = {}
                 continue
-
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             df.index = pd.to_datetime(df.index).date
@@ -537,11 +498,80 @@ def fetch_prices(symbols, date_objects, fill_holidays=False, adjusted=False):
                 if not filled:
                     close_map[dt] = None
             else:
-                close_map[dt] = None   # holiday/weekend → blank
-
+                close_map[dt] = None
         results[symbol] = close_map
 
+    return results, failed, failed_errors, holiday_fills
+
+
+def fetch_prices(symbols, date_objects, fill_holidays=False, adjusted=False):
+    """
+    Returns: results, failed, failed_errors, holiday_fills
+
+    PRIMARY SOURCE: official NSE bhavcopy (nsearchives.nseindia.com).
+    One request per DATE returns every NSE symbol, so cost scales with the
+    number of dates, not the number of symbols — and there is no rate limit,
+    because it is a static file host rather than a query API.
+
+    Symbols the bhavcopy cannot resolve (e.g. BSE-only scrips) fall back to
+    yfinance individually. All failures surface in the alert table with a
+    specific reason.
+    """
+    symbols       = list(symbols)
+    date_objects  = list(date_objects)
+    total_dates   = len(set(date_objects))
+
+    progress = st.progress(0, text=f"Fetching NSE bhavcopy for {total_dates} date(s)…")
+
+    def _cb(done, total, d):
+        pct = int(done / max(total, 1) * 90)
+        progress.progress(pct, text=f"NSE bhavcopy {done}/{total} — {d}")
+
+    try:
+        results, failed, failed_errors, holiday_fills = nse_bhavcopy.fetch_closes(
+            symbols, date_objects, fill_holidays=fill_holidays, progress_cb=_cb
+        )
+        source_note = "NSE bhavcopy"
+    except Exception as e:
+        progress.progress(90, text="NSE archive unavailable — falling back to Yahoo…")
+        st.warning(f"NSE bhavcopy unavailable ({str(e)[:100]}) — using Yahoo Finance fallback.")
+        results, failed, failed_errors, holiday_fills = _fetch_prices_yf(
+            tuple(symbols), tuple(date_objects), fill_holidays=fill_holidays, adjusted=adjusted
+        )
+        progress.progress(100, text="Done!")
+        st.session_state["price_source"] = "Yahoo Finance (fallback)"
+        return results, failed, failed_errors, holiday_fills
+
+    # Retry bhavcopy misses individually via Yahoo (e.g. BSE-only symbols)
+    if failed:
+        progress.progress(92, text=f"Retrying {len(failed)} symbol(s) via Yahoo…")
+        retry = list(failed)
+        try:
+            yf_res, yf_failed, yf_errs, yf_fills = _fetch_prices_yf(
+                tuple(retry), tuple(date_objects),
+                fill_holidays=fill_holidays, adjusted=adjusted,
+            )
+            recovered = []
+            for sym in retry:
+                vals = yf_res.get(sym, {})
+                if any(v is not None for v in vals.values()):
+                    results[sym] = vals
+                    recovered.append(sym)
+                    failed_errors.pop(sym, None)
+            if recovered:
+                source_note = "NSE bhavcopy + Yahoo fallback"
+                holiday_fills |= yf_fills
+            failed = [s for s in retry if s not in recovered]
+            for sym in failed:
+                if sym in yf_errs:
+                    failed_errors[sym] = (
+                        failed_errors.get(sym, "") + f" | Yahoo: {yf_errs[sym][:60]}"
+                    ).strip(" |")
+        except Exception:
+            pass  # keep the bhavcopy reasons already in failed_errors
+
     progress.progress(100, text="Done!")
+    st.session_state["price_source"] = source_note
     return results, failed, failed_errors, holiday_fills
 
 
