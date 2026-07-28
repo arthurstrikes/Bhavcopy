@@ -75,17 +75,18 @@ Options: **Last trading day** (default), **specific dates**, or a **date range**
 | NSE Broad | `NIFTY50`, `NIFTY100`, `NIFTY200`, `NIFTY500`, `NIFTYNEXT50` |
 | NSE Mid/Small | `NIFTYMIDCAP100`, `NIFTYMID100`, `NIFTYSMALLCAP100`, `NIFTYSC100` |
 | NSE Sectoral | `BANKNIFTY`, `NIFTYIT`, `NIFTYAUTO`, `NIFTYPHARMA`, `NIFTYFMCG`, `NIFTYMETAL`, `NIFTYREALTY`, `NIFTYENERGY`, `NIFTYPSUBANK`, `FINNIFTY` |
-| NSE Composite† | `NIFTYMIDSML400`, `NIFTY200MOM30`, `NIFTYLARGEMID250` |
+| NSE Composite | `NIFTYMIDSML400`, `NIFTY200MOM30`, `NIFTYLARGEMID250` |
 | BSE Broad | `SENSEX`, `BSE100`, `BSE200`, `BSE500` |
 | BSE Mid/Small | `BSEMIDCAP`, `BSESMALLCAP` |
 | BSE Sectoral | `BSEBANK`, `BSEIT`, `BSEAUTO`, `BSEPHARMA`, `BSEFMCG`, `BSEMETAL`, `BSEREALTY`, `BSEENERGY` |
 | Volatility | `INDIAVIX`, `VIX` |
 
-† NSE Composite indices are not available on Yahoo Finance. The app will flag them and direct you to download from NSE India manually.
-
 **Notes:**
 - Use exact NSE ticker symbols for stocks: `BAJAJ-AUTO`, `M&M`, `L&T` etc.
-- Large batches (50+ stocks × many dates) take 2–4 minutes.
+- Prices are fetched from NSE's official bhavcopy — fast even for large batches
+  (typically a few seconds regardless of symbol count, since one file covers
+  every NSE symbol per date). Yahoo Finance is used only as a fallback for
+  symbols NSE's bhavcopy can't resolve (e.g. BSE-only scrips).
 - Adjusted prices affect historical values — use unadjusted for most report work.
     """)
 
@@ -938,5 +939,5 @@ with tab_quick:
 
 # ── FOOTER ───────────────────────────────────────────────────
 st.markdown("---")
-st.caption("Bhavcopy v1.3  |  NSE stocks + NSE/BSE indexes via Yahoo Finance (unadjusted by default)  |  Blanks = market holiday or weekend  |  Built for Motilal Oswal Research")
+st.caption("Bhavcopy v1.4  |  NSE stocks + indexes via official NSE bhavcopy (Yahoo Finance fallback)  |  Unadjusted by default  |  Blanks = market holiday or weekend  |  Built for Motilal Oswal Research")
 
