@@ -41,7 +41,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.markdown('<div class="title">📈 NAV Calculator — IMP Portfolios</div>', unsafe_allow_html=True)
-st.markdown('<div class="sub">Daily rebased NAV from inception · EOD prices via Yahoo Finance · Version A (log trade prices + EOD MTM)</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub">Daily rebased NAV from inception · EOD prices via NSE bhavcopy · Version A (log trade prices + EOD MTM)</div>', unsafe_allow_html=True)
 
 # ── CONSTANTS ─────────────────────────────────────────────────────────────────
 CAPITAL_OPTIONS = {
@@ -602,13 +602,14 @@ if uploaded is None:
         st.markdown("""
 **What this tool does:**
 1. Parses the historical log to reconstruct every trade since inception
-2. Fetches EOD closing prices from Yahoo Finance for all active holdings
+2. Fetches EOD closing prices from NSE's official bhavcopy for all active holdings
+   (Yahoo Finance used only as a fallback for symbols NSE can't resolve)
 3. Calculates daily NAV = Market Value of holdings + Unutilised Cash
 4. Rebases NAV to 100 on inception date
 
 **Price logic (Version A):**
 - Trade quantity uses the **log price** (RA execution price) at each buy/rebalance/exit
-- Daily MTM uses **Yahoo Finance EOD closing prices**
+- Daily MTM uses **NSE bhavcopy closing prices** (Yahoo Finance fallback if unresolved)
 - LIQUIDCASE and any liquid ETF = treated as cash (excluded from holdings)
 - Zero price in log = system glitch → EOD price substituted automatically with a warning
 
