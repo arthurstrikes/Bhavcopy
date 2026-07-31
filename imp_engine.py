@@ -34,6 +34,7 @@ skipped silently and nothing is log-only.
 
 from __future__ import annotations
 
+import io
 import math
 import re
 from collections import defaultdict
@@ -55,6 +56,37 @@ ALERT_NO_CLOSE = "NO EOD CLOSE"
 
 def is_liquid(symbol: str) -> bool:
     return any(k in str(symbol).upper() for k in LIQUID_KEYWORDS)
+
+
+def _read_csv_any_delimiter(uploaded):
+    """
+    Read a CSV without assuming the delimiter.
+
+    The dashboard export has shipped as both pipe-delimited and comma-delimited.
+    Hardcoding one produces a single-column frame and a misleading "missing
+    columns" error listing every column the file plainly contains. Each candidate
+    is tried and the one yielding the most columns wins; quoted fields (rationale
+    text, prices like "1,251.00") are handled by the parser, so an embedded
+    comma never wins a delimiter vote on its own.
+    """
+    raw = uploaded.read() if hasattr(uploaded, "read") else open(uploaded, "rb").read()
+    if isinstance(raw, str):
+        raw = raw.encode("utf-8")
+
+    best, best_cols = None, 0
+    for sep in (",", "|", "\t", ";"):
+        try:
+            probe = pd.read_csv(io.BytesIO(raw), sep=sep, dtype=str,
+                                encoding="utf-8", nrows=5, engine="python")
+        except Exception:
+            continue
+        if probe.shape[1] > best_cols:
+            best, best_cols = sep, probe.shape[1]
+
+    if best is None:
+        raise ValueError("could not determine the delimiter")
+    return pd.read_csv(io.BytesIO(raw), sep=best, dtype=str,
+                       encoding="utf-8", engine="python")
 
 
 def _num(v) -> float:
@@ -110,7 +142,7 @@ def load_log(uploaded):
     name = getattr(uploaded, "name", str(uploaded)).lower()
     try:
         if name.endswith(".csv"):
-            df = pd.read_csv(uploaded, sep="|", dtype=str, encoding="utf-8")
+            df = _read_csv_any_delimiter(uploaded)
         elif name.endswith((".xlsx", ".xls")):
             df = pd.read_excel(uploaded, dtype=str)
         else:
