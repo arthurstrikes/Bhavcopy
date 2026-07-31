@@ -13,6 +13,7 @@ from datetime import date, datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import requests
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
@@ -132,11 +133,35 @@ def fetch_benchmark(name: str, start: date, end: date):
     return prices
 
 
-def to_excel(nav_df, holdings_df, trades_df, alerts_df, recon_df):
+@st.cache_data(show_spinner=False, ttl=7 * 24 * 3600)
+def fetch_ca(days):
+    """NSE corporate-action calendar, same archive host as the bhavcopy."""
+    import time as _t
+    sess = requests.Session()
+    sess.headers.update(nse_bhavcopy.HEADERS)
+
+    def get(url):
+        r = None
+        for a in range(5):
+            r = sess.get(url, timeout=40)
+            if r.status_code not in (403, 503, 429):
+                return r
+            _t.sleep(1.5 * (a + 1))
+        return r
+
+    df = engine.fetch_ca_calendar(days, get)
+    return df.to_dict("records")
+
+
+def to_excel(perf_df, nav_df, holdings_df, trades_df, alerts_df, recon_df,
+             wt_matrix, qty_matrix):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        perf_df.to_excel(w, sheet_name="Performance", index=False)
         nav_df.to_excel(w, sheet_name="Daily NAV", index=False)
         holdings_df.to_excel(w, sheet_name="Final Holdings", index=False)
+        wt_matrix.to_excel(w, sheet_name="Holdings Wt Matrix", index=False)
+        qty_matrix.to_excel(w, sheet_name="Holdings Qty Matrix", index=False)
         trades_df.to_excel(w, sheet_name="Trades", index=False)
         alerts_df.to_excel(w, sheet_name="Alerts", index=False)
         recon_df.to_excel(w, sheet_name="Reconciliation", index=False)
@@ -164,7 +189,43 @@ with st.sidebar:
         help="On. Every holding is checked against its model weight on any date "
              "carrying a log row. Off = only symbols named in the log that date can trade.")
 
-    benchmark = st.selectbox("Benchmark overlay", ["None", "Nifty 50", "Nifty 500", "Sensex"])
+    st.markdown("---")
+    st.markdown("### Corporate actions")
+    ca_on = st.checkbox("Adjust for corporate actions", value=True,
+                        help="Fetches NSE's official CA calendar and restates the "
+                             "affected symbol's price series and log prices onto one "
+                             "basis. Dividends are never adjusted - this is a "
+                             "price-return framework.")
+    ca_mode = st.radio("Basis", ["pre_ex_down", "post_ex_up"], index=0,
+                       format_func=lambda m: ("Restate history (recommended)"
+                                              if m == "pre_ex_down"
+                                              else "Keep history, scale forward"),
+                       help="Both give the same return series. Restating history "
+                            "keeps post-ex trades at real prices, so share counts "
+                            "match a real client's.")
+    dm_policy = st.radio(
+        "Demergers", ["require", "gap"], index=0,
+        format_func=lambda m: ("Require a factor (recommended)" if m == "require"
+                               else "Approximate from the price gap"),
+        help="Splits and bonuses carry exact terms in NSE's file and are always "
+             "handled exactly. Demergers do not - the value split is only in the "
+             "scheme document. Approximating from the gap treats the day's genuine "
+             "market move as part of the action and overstates returns.")
+    ca_override_txt = st.text_area(
+        "Demerger factors", height=80,
+        placeholder="TRIVENI, 2026-07-22, -5.39%\nVEDL, 2026-04-30, 2.8412",
+        help="One per line: SYMBOL, EX-DATE, VALUE. Value is either the true "
+             "ex-date return (with a % sign) or an explicit price factor.")
+    ca_method = st.radio("Ex-date factor", ["gap", "index"], index=0, horizontal=True,
+                         format_func=lambda m: ("Price gap" if m == "gap"
+                                                else "Index-relative"),
+                         help="Price gap assumes the symbol's genuine return on the "
+                              "ex-date was 0%. Index-relative assumes it moved with "
+                              "the benchmark that day.")
+
+    benchmark = st.selectbox("Benchmark", ["None", "Nifty 50", "Nifty 500", "Sensex"],
+                             index=2,
+                             help="Drives both the chart overlay and the period performance table. Price return - the NSE bhavcopy is a price series.")
 
     st.markdown("---")
     st.markdown("### Upload log")
@@ -226,7 +287,8 @@ Log parsed - <strong>{len(log_df)}</strong> rows
 </div>""", unsafe_allow_html=True)
 
 params = (uploaded.name, capital, start_override, to_date, gate_pp,
-          force_retarget, benchmark)
+          force_retarget, benchmark, ca_on, ca_mode, ca_method,
+          dm_policy, ca_override_txt)
 if run_btn:
     st.session_state["nav_run"] = True
 if st.session_state.get("nav_params") != params:
@@ -249,6 +311,45 @@ if "nav_results" not in st.session_state:
                     'Check the date window and the archive host.</div>',
                     unsafe_allow_html=True)
         st.stop()
+    bench = fetch_benchmark(benchmark, start_override, to_date) if benchmark != "None" else {}
+
+    ca_overrides, ca_bad = {}, []
+    for line in (ca_override_txt or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) != 3:
+            ca_bad.append((line, "expected SYMBOL, EX-DATE, VALUE"))
+            continue
+        sym_o, ex_o, val_o = parts
+        ex_d = engine.parse_date(ex_o)
+        if ex_d is None:
+            ca_bad.append((line, f"could not parse the date '{ex_o}'"))
+            continue
+        try:
+            if val_o.endswith("%"):
+                ca_overrides[(sym_o.upper(), ex_d)] = {
+                    "true_ret": float(val_o.rstrip("%")) / 100.0}
+            else:
+                ca_overrides[(sym_o.upper(), ex_d)] = float(val_o)
+        except ValueError:
+            ca_bad.append((line, f"could not parse the value '{val_o}'"))
+
+    ca_alerts, ca_actions = [], []
+    for line, why in ca_bad:
+        ca_alerts.append(dict(Date=None, Symbol="-", Type="CA OVERRIDE IGNORED",
+                              Detail=f"{line} - {why}"))
+    if ca_on:
+        with st.spinner("Fetching NSE corporate-action calendar..."):
+            ca_actions = [a for a in fetch_ca(tuple(sorted(closes)))
+                          if a["Symbol"] in set(log_df.loc[~log_df["is_liquid"], "symbol"])]
+        closes, log_df, applied = engine.apply_corporate_actions(
+            closes, log_df, ca_actions, mode=ca_mode, method=ca_method, bench=bench,
+            overrides=ca_overrides, demerger_policy=dm_policy)
+        ca_alerts += applied
+    ca_alerts += engine.gap_detector(closes, log_df, ca_actions, threshold_pct=20.0)
+
     with st.spinner("Running the NAV engine..."):
         try:
             nav_rows, trades, alerts = engine.run_nav(
@@ -259,7 +360,7 @@ if "nav_results" not in st.session_state:
             st.stop()
     for d, err in sorted(fetch_errors.items()):
         alerts.append(dict(Date=d, Symbol="-", Type="BHAVCOPY FETCH ERROR", Detail=err))
-    bench = fetch_benchmark(benchmark, start_override, to_date) if benchmark != "None" else {}
+    alerts = ca_alerts + alerts
     st.session_state["nav_results"] = (nav_rows, trades, alerts, bench)
 
 nav_rows, trades, alerts, bench = st.session_state["nav_results"]
@@ -270,6 +371,10 @@ trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(
 alerts_df = pd.DataFrame(alerts) if alerts else pd.DataFrame(
     columns=["Date", "Symbol", "Type", "Detail"])
 recon_df = engine.reconciliation(nav_rows)
+wt_matrix = engine.holdings_matrix(nav_rows, "weight")
+qty_matrix = engine.holdings_matrix(nav_rows, "qty")
+perf_df = engine.period_returns(nav_rows, capital, bench,
+                                benchmark if benchmark != "None" else "Benchmark")
 
 last, first = nav_rows[-1], nav_rows[0]
 total_return = (last["NAV"] - capital) / capital * 100
@@ -310,6 +415,29 @@ kpi(cols[3], "Absolute return", fmt_pct(total_return),
     "gain" if total_return >= 0 else "loss")
 kpi(cols[4], "Absolute P&L", fmt_inr(abs_pl), "gain" if abs_pl >= 0 else "loss")
 kpi(cols[5], "Sessions", f"{len(nav_rows)}")
+
+st.markdown("<br>", unsafe_allow_html=True)
+
+# -- period performance -------------------------------------------------------
+
+st.markdown(f"#### Performance vs benchmark &mdash; as of {last['Date']:%d %b %Y}")
+bcol = f"{benchmark} %" if benchmark != "None" else "Benchmark %"
+st.dataframe(
+    perf_df, use_container_width=True, hide_index=True,
+    column_config={
+        "Days": st.column_config.NumberColumn(format="%d"),
+        "Portfolio %": st.column_config.NumberColumn(format="%.2f"),
+        bcol: st.column_config.NumberColumn(format="%.2f"),
+        "Outperf pp": st.column_config.NumberColumn(format="%.2f"),
+    })
+note = ("Point-to-point price returns, both legs. Base session is the last session "
+        "on or before each period anchor; periods starting before inception show n/a. "
+        f"Cash weight on {last['Date']:%d %b %Y} is "
+        f"{(last['Cash'] / last['NAV'] * 100 if last['NAV'] else 0):.1f}% &mdash; "
+        "the benchmark is fully invested, so part of any gap is cash drag.")
+if benchmark == "None":
+    note = "Select a benchmark in the sidebar to populate the comparison columns. " + note
+st.caption(note)
 
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -402,7 +530,8 @@ with col_s:
 # -- tables -------------------------------------------------------------------
 
 st.markdown("---")
-tab_nav, tab_trades, tab_recon = st.tabs(["Daily NAV", "Trades", "Reconciliation"])
+tab_nav, tab_book, tab_matrix, tab_trades, tab_recon = st.tabs(
+    ["Daily NAV", "Holdings on a date", "Holdings matrix", "Trades", "Reconciliation"])
 
 with tab_nav:
     flt = st.selectbox("Rows", ["All", "Event days only", "MTM days only"], key="navflt")
@@ -421,6 +550,36 @@ with tab_nav:
                      "NAV": st.column_config.NumberColumn(format="%.2f"),
                      "DayPL": st.column_config.NumberColumn(format="%.2f"),
                  })
+
+with tab_book:
+    sessions = [r["Date"] for r in nav_rows]
+    pick = st.selectbox("Session", sessions[::-1], index=0, key="book_date",
+                        format_func=lambda d: d.strftime("%d %b %Y (%a)"))
+    row, book = engine.holdings_on(nav_rows, pick)
+    if row is not None:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("NAV", fmt_inr(row["NAV"]))
+        m2.metric("Market value", fmt_inr(row["MarketValue"]))
+        m3.metric("Cash", fmt_inr(row["Cash"]),
+                  f"{row['Cash'] / row['NAV'] * 100:.1f}% of NAV" if row["NAV"] else None)
+        m4.metric("Positions", str(row["Positions"]))
+        if len(book):
+            st.dataframe(book, use_container_width=True, hide_index=True, height=420)
+            st.caption(f"{row['Type']} day. DriftPP within the {gate_pp:.2f}pp gate is "
+                       "expected and untraded.")
+        else:
+            st.info("Fully in cash on this session.")
+
+with tab_matrix:
+    measure = st.radio("Measure", ["Weight %", "Quantity"], horizontal=True, key="mx")
+    mx = wt_matrix if measure == "Weight %" else qty_matrix
+    st.dataframe(mx.iloc[::-1].reset_index(drop=True), use_container_width=True,
+                 hide_index=True, height=460)
+    if measure == "Weight %":
+        st.caption("TOTAL is holdings + cash and should read 100.00 every row "
+                   "(small rounding only). Any other value is a bug - report it.")
+    else:
+        st.caption("Share counts held at each session close. Blank = not held.")
 
 with tab_trades:
     if len(trades_df):
@@ -441,14 +600,15 @@ with tab_recon:
 
 st.markdown("---")
 if "nav_excel" not in st.session_state:
-    st.session_state["nav_excel"] = to_excel(nav_df, holdings_export, trades_df,
-                                             alerts_df, recon_df)
+    st.session_state["nav_excel"] = to_excel(perf_df, nav_df, holdings_export,
+                                             trades_df, alerts_df, recon_df,
+                                             wt_matrix, qty_matrix)
     st.session_state["nav_csv"] = nav_df.to_csv(index=False).encode()
 
 stem = uploaded.name.rsplit(".", 1)[0]
 e1, e2 = st.columns(2)
 with e1:
-    st.download_button("Download Excel (NAV, holdings, trades, alerts, reconciliation)",
+    st.download_button("Download Excel (8 sheets: performance, NAV, holdings, matrices, trades, alerts, recon)",
                        data=st.session_state["nav_excel"],
                        file_name=f"NAV_{stem}_{to_date:%d%b%Y}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument."
