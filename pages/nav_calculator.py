@@ -100,37 +100,45 @@ def fetch_closes(start: date, end: date):
     return out, errors
 
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_benchmark(name: str, start: date, end: date):
-    """Nifty 50/500 from NSE index bhavcopy; Sensex (BSE) from yfinance."""
-    prices = {}
-    if name in ("Nifty 50", "Nifty 500"):
-        try:
-            res, _, _, _ = nse_bhavcopy.fetch_closes(
-                [name], engine.calendar_days(start, end), fill_holidays=False)
-            prices = {d: v for d, v in res.get(name, {}).items() if v is not None}
-        except Exception:
-            prices = {}
-    if not prices:
+def benchmark_series(closes, name, start, end):
+    """
+    Benchmark from the bhavcopy files ALREADY fetched.
+
+    nse_bhavcopy.fetch_day returns equities and indices merged, so every index
+    close is sitting in `closes` from the first pass. Re-fetching it cost a
+    second full sweep of the archive and, when that sweep hit a hiccup, silently
+    fell through to yfinance - which rate-limits Streamlit Cloud's shared IPs.
+    Only Sensex needs the network, being a BSE index NSE does not publish.
+    """
+    if name == "None":
+        return {}
+    if name == "Sensex":
         try:
             df = yf.download(BENCH_MAP[name], start=start.strftime("%Y-%m-%d"),
                              end=(end + timedelta(days=2)).strftime("%Y-%m-%d"),
-                             interval="1d", progress=False, auto_adjust=False, actions=False)
-            if not df.empty:
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = df.columns.get_level_values(0)
-                cc = next((c for c in df.columns if "close" in c.lower()), None)
-                if cc:
-                    for idx, row in df.iterrows():
-                        try:
-                            v = float(row[cc])
-                            if not np.isnan(v):
-                                prices[idx.date()] = v
-                        except Exception:
-                            pass
+                             interval="1d", progress=False, auto_adjust=False,
+                             actions=False)
+            if df.empty:
+                return {}
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            cc = next((c for c in df.columns if "close" in c.lower()), None)
+            if cc is None:
+                return {}
+            out = {}
+            for idx, row in df.iterrows():
+                try:
+                    v = float(row[cc])
+                    if not np.isnan(v):
+                        out[idx.date()] = v
+                except Exception:
+                    pass
+            return out
         except Exception:
-            pass
-    return prices
+            return {}
+
+    key = nse_bhavcopy.resolve_index_name(name) or name.upper()
+    return {d: m[key] for d, m in closes.items() if key in m and m[key] > 0}
 
 
 @st.cache_data(show_spinner=False, ttl=7 * 24 * 3600)
@@ -151,6 +159,19 @@ def fetch_ca(days):
 
     df = engine.fetch_ca_calendar(days, get)
     return df.to_dict("records")
+
+
+def ca_sample_days(sessions, every=3):
+    """
+    NSE lists an action in the PR file for at least 7 calendar days before its
+    ex-date - measured across every action in the reference period, the shortest
+    lead was 7 days, roughly 5 sessions. Sampling every 3rd session therefore
+    cannot miss one, and cuts the download from ~193 files to ~65.
+    """
+    days = list(sessions[::every])
+    if sessions and sessions[-1] not in days:
+        days.append(sessions[-1])
+    return tuple(days)
 
 
 def to_excel(perf_df, nav_df, holdings_df, trades_df, alerts_df, recon_df,
@@ -311,7 +332,7 @@ if "nav_results" not in st.session_state:
                     'Check the date window and the archive host.</div>',
                     unsafe_allow_html=True)
         st.stop()
-    bench = fetch_benchmark(benchmark, start_override, to_date) if benchmark != "None" else {}
+    bench = benchmark_series(closes, benchmark, start_override, to_date)
 
     ca_overrides, ca_bad = {}, []
     for line in (ca_override_txt or "").splitlines():
@@ -342,7 +363,7 @@ if "nav_results" not in st.session_state:
                               Detail=f"{line} - {why}"))
     if ca_on:
         with st.spinner("Fetching NSE corporate-action calendar..."):
-            ca_actions = [a for a in fetch_ca(tuple(sorted(closes)))
+            ca_actions = [a for a in fetch_ca(ca_sample_days(sorted(closes)))
                           if a["Symbol"] in set(log_df.loc[~log_df["is_liquid"], "symbol"])]
         closes, log_df, applied = engine.apply_corporate_actions(
             closes, log_df, ca_actions, mode=ca_mode, method=ca_method, bench=bench,
