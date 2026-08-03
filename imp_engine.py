@@ -47,11 +47,13 @@ GATE_PP = 1.0
 CHAIN_TOL = 0.02
 
 ALERT_CHAIN = "CHAIN UNRESOLVED"
-ALERT_FORCED = "FORCED RETARGET (no log row)"
+ALERT_FORCED = "FORCED REBALANCE (no log row)"
 ALERT_ZERO_PX = "LOG PRICE ZERO"
 ALERT_NO_PX = "NO PRICE - TRADE SKIPPED"
 ALERT_NEG_CASH = "NEGATIVE CASH"
 ALERT_NO_CLOSE = "NO EOD CLOSE"
+ALERT_STALE_PX = "PRE-START ADVICE - REPRICED"
+ALERT_DIVIDEND = "DIVIDEND CREDITED"
 
 
 def is_liquid(symbol: str) -> bool:
@@ -219,7 +221,7 @@ def resolve_chain(rows, current_wt):
 
 
 def build_events(log):
-    """{date: {symbol: (target_wt, exec_price)}}, collapsed to the last chain link."""
+    """{date: {symbol: (target_wt, exec_price, advice_date)}}, last chain link."""
     events = defaultdict(dict)
     alerts = []
     state = {}
@@ -240,7 +242,7 @@ def build_events(log):
                 continue
             last = ordered[-1]
             px = last["entry_px"] if last["old_wt"] == 0 else last["mod_px"]
-            events[d][symbol] = (float(last["new_wt"]), float(px))
+            events[d][symbol] = (float(last["new_wt"]), float(px), d)
             state[symbol] = float(last["new_wt"])
 
     return dict(events), alerts
@@ -249,7 +251,8 @@ def build_events(log):
 # -- engine -------------------------------------------------------------------
 
 def run_nav(log, closes, capital, start, to_date,
-            gate_pp=GATE_PP, force_retarget=True):
+            gate_pp=GATE_PP, force_retarget=True, dividends=None,
+            stale_price_policy="start_close"):
     """
     closes : {date: {SYMBOL: close}} - trading days only (a 404 from the NSE
              archive is the authoritative "no session" signal).
@@ -259,7 +262,15 @@ def run_nav(log, closes, capital, start, to_date,
     equity_log = log[~log["is_liquid"]]
     events, alerts = build_events(equity_log)
 
-    # Advice dated before the chosen start is executed on the start date.
+    # Advice dated before the chosen start collapses onto the start date. The
+    # dict update in date order means the LAST value per symbol wins, so day 1
+    # opens with the model's state as at the start date - not a replay of every
+    # trade since the log began.
+    #
+    # Those positions must fill at the START DATE's close, not the log price from
+    # whenever the advice was issued. A client starting 1 Apr cannot buy GLENMARK
+    # at 25 March's 2165.00 when it closed at 2101.10 that day - a 3% fiction.
+    # advice_date is carried through so run_nav can tell the two apart.
     clamped = defaultdict(dict)
     for d, syms in sorted(events.items()):
         clamped[start if d < start else d].update(syms)
@@ -271,6 +282,8 @@ def run_nav(log, closes, capital, start, to_date,
 
     model, portfolio, last_px, seen_missing = {}, {}, {}, set()
     cash = float(capital)
+    div_cash = 0.0
+    div_events = []
     base_nav = float(capital)
     nav_rows, trades = [], []
 
@@ -278,7 +291,7 @@ def run_nav(log, closes, capital, start, to_date,
         today = closes[day]
 
         if day in events:
-            for symbol, (wt, _) in events[day].items():
+            for symbol, (wt, _, _adv) in events[day].items():
                 if wt == 0:
                     model.pop(symbol, None)
                 else:
@@ -299,6 +312,22 @@ def run_nav(log, closes, capital, start, to_date,
 
                 if symbol in events[day]:
                     price, source = events[day][symbol][1], "log"
+                    adv = events[day][symbol][2]
+                    if adv != day and stale_price_policy == "start_close":
+                        close_px = today.get(symbol, 0.0)
+                        if close_px > 0:
+                            alerts.append(dict(
+                                Date=day, Symbol=symbol, Type=ALERT_STALE_PX,
+                                Detail=(f"advice dated {adv} predates the start date; "
+                                        f"log price {price} replaced with the {day} "
+                                        f"close {close_px}")))
+                            price, source = close_px, "start-close"
+                        else:
+                            alerts.append(dict(
+                                Date=day, Symbol=symbol, Type=ALERT_STALE_PX,
+                                Detail=(f"advice dated {adv} predates the start date "
+                                        f"and there is no {day} close; using the log "
+                                        f"price {price}")))
                 else:
                     price, source = today.get(symbol, 0.0), "eod-forced"
                     alerts.append(dict(
@@ -365,6 +394,23 @@ def run_nav(log, closes, capital, start, to_date,
                            "carried at last known price; verify the NSE symbol",
                 ))
 
+        # Dividends: credit cash, leave prices untouched. The bhavcopy close on
+        # an ex-date has ALREADY dropped by roughly the DPS - that drop is real
+        # and is not adjusted away. Crediting the cash restores the value, so NAV
+        # is continuous through the event and the income is captured exactly once.
+        for ev in (dividends or {}).get(day, []):
+            qty = portfolio.get(ev["symbol"], 0)
+            if qty > 0 and ev["dps"] > 0:
+                amt = qty * ev["dps"]
+                div_cash += amt
+                div_events.append(dict(Date=day, Symbol=ev["symbol"],
+                                       DPS=round(ev["dps"], 4), Qty=qty,
+                                       Amount=round(amt, 2), Purpose=ev.get("purpose", "")))
+                alerts.append(dict(Date=day, Symbol=ev["symbol"], Type=ALERT_DIVIDEND,
+                                   Detail=(f"{ev.get('purpose','dividend')}: "
+                                           f"{qty} x {ev['dps']:g} = {amt:,.2f} "
+                                           f"credited to the dividend-inclusive basis")))
+
         mkt_val = sum(q * last_px.get(s, 0.0) for s, q in portfolio.items())
         nav = mkt_val + cash
         prev = nav_rows[-1]["NAV"] if nav_rows else float(capital)
@@ -373,18 +419,27 @@ def run_nav(log, closes, capital, start, to_date,
                             model_wt=model.get(s, 0.0))
                     for s, q in portfolio.items()}
 
+        # Dividend cash is tracked in parallel and never re-invested, so it can
+        # never change a trade quantity. The two bases therefore differ by exactly
+        # the cumulative dividends received - nothing else.
+        nav_tr = nav + div_cash
+        prev_tr = nav_rows[-1]["NAV_TR"] if nav_rows else float(capital)
+
         nav_rows.append(dict(
             Date=day, MarketValue=round(mkt_val, 2), Cash=round(cash, 2),
             NAV=round(nav, 2), Rebased=round(nav / capital * 100.0, 4),
             DayPL=round(nav - prev, 2),
             DayReturnPct=round((nav - prev) / prev * 100.0, 4) if prev else 0.0,
+            DividendCash=round(div_cash, 2), NAV_TR=round(nav_tr, 2),
+            Rebased_TR=round(nav_tr / capital * 100.0, 4),
+            DayReturnPct_TR=round((nav_tr - prev_tr) / prev_tr * 100.0, 4) if prev_tr else 0.0,
             Positions=len(portfolio),
             Type="TRADE" if day in events else "MTM",
             _holdings=holdings,
         ))
         base_nav = nav
 
-    return nav_rows, trades, alerts
+    return nav_rows, trades, alerts, div_events
 
 
 def reconciliation(nav_rows):
@@ -478,7 +533,7 @@ def holdings_matrix(nav_rows, measure="weight"):
 _PERIODS = (("MTD", None), ("1M", 1), ("3M", 3), ("6M", 6), ("1Y", 12))
 
 
-def period_returns(nav_rows, capital, bench=None, bench_name="Benchmark"):
+def period_returns(nav_rows, capital, bench=None, bench_name="Benchmark", key="NAV"):
     """
     Point-to-point price returns for MTD / 1M / 3M / 6M / 1Y / Since launch.
 
@@ -492,7 +547,7 @@ def period_returns(nav_rows, capital, bench=None, bench_name="Benchmark"):
     portfolio excludes dividends, so the two are consistent.
     """
     dates = [r["Date"] for r in nav_rows]
-    navs = {r["Date"]: r["NAV"] for r in nav_rows}
+    navs = {r["Date"]: r[key] for r in nav_rows}
     inception, as_of = dates[0], dates[-1]
     bench = bench or {}
     bench_dates = sorted(bench)
@@ -796,3 +851,276 @@ def gap_detector(closes, log, actions, threshold_pct=20.0):
                                            f"{px}; no corporate action on file - verify"))
             prev_d, prev_px = d, px
     return out
+
+
+# -- dividends ----------------------------------------------------------------
+
+_DPS_RE = re.compile(r"(?:RS|RE)\.?\s*([0-9]+(?:\.[0-9]+)?)", re.I)
+DIV_DEDUP_WINDOW_DAYS = 7
+
+
+def parse_dps(purpose):
+    """
+    Rupees per share from the PURPOSE text. Parsed cleanly on all 103 dividend
+    records in the reference period.
+
+      "INTDIV - RS 12 PER SH"      -> 12.0
+      "DIV - RE 0.50 PER SH"       -> 0.5
+      "INTDIV-RS11/SPLDIV-RS46"    -> 57.0   (components sum)
+
+    Returns None when the string carries no dividend or no parseable amount, so
+    the caller can alert rather than silently assume zero.
+    """
+    text = str(purpose).upper()
+    if "DIV" not in text:
+        return None
+    vals = [float(v) for v in _DPS_RE.findall(text)]
+    return sum(vals) if vals else None
+
+
+def build_dividends(actions, held_symbols):
+    """
+    {ex_date: [{symbol, dps, purpose}]} plus alerts.
+
+    De-duplicated on (symbol, dps) within a 7-day window. NSE lists the same
+    dividend under several series with slightly different ex-dates - BEL appears
+    on both 05-Mar and 06-Mar at RS 1.95, which would otherwise be counted twice.
+    """
+    parsed, alerts = [], []
+    for a in actions:
+        sym = a["Symbol"]
+        if sym not in held_symbols or "DIV" not in str(a["Purpose"]).upper():
+            continue
+        dps = parse_dps(a["Purpose"])
+        if dps is None or dps <= 0:
+            alerts.append(dict(Date=a["ExDate"], Symbol=sym,
+                               Type="DIVIDEND NOT PARSED",
+                               Detail=f"could not read an amount from '{a['Purpose']}'"))
+            continue
+        parsed.append(dict(symbol=sym, ex=a["ExDate"], dps=dps, purpose=a["Purpose"]))
+
+    parsed.sort(key=lambda x: (x["symbol"], x["dps"], x["ex"]))
+    kept, last = [], {}
+    for p in parsed:
+        key = (p["symbol"], round(p["dps"], 4))
+        prev = last.get(key)
+        if prev and (p["ex"] - prev).days <= DIV_DEDUP_WINDOW_DAYS:
+            alerts.append(dict(Date=p["ex"], Symbol=p["symbol"],
+                               Type="DUPLICATE DIVIDEND SUPPRESSED",
+                               Detail=(f"{p['purpose']} on {p['ex']} repeats the same "
+                                       f"amount already recorded on {prev} - counted once")))
+            continue
+        last[key] = p["ex"]
+        kept.append(p)
+
+    by_date = defaultdict(list)
+    for p in kept:
+        by_date[p["ex"]].append(dict(symbol=p["symbol"], dps=p["dps"],
+                                     purpose=p["purpose"]))
+    return dict(by_date), alerts
+
+
+# -- corporate action overrides file ------------------------------------------
+
+CA_OVERRIDE_FILE = "ca_overrides.csv"
+
+
+def parse_override_lines(text):
+    """
+    'SYMBOL, EX-DATE, VALUE' per line. VALUE is a price factor, or a true ex-date
+    return when it ends in '%'. Returns (overrides, rejected).
+    """
+    overrides, rejected = {}, []
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line or line.lstrip().startswith("#"):
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 3:
+            rejected.append((line, "expected SYMBOL, EX-DATE, VALUE"))
+            continue
+        sym, ex_raw, val = parts[0].upper(), parts[1], parts[2]
+        ex = parse_date(ex_raw)
+        if ex is None:
+            rejected.append((line, f"could not read the date '{ex_raw}'"))
+            continue
+        try:
+            overrides[(sym, ex)] = ({"true_ret": float(val.rstrip("%")) / 100.0}
+                                    if val.endswith("%") else float(val))
+        except ValueError:
+            rejected.append((line, f"could not read the value '{val}'"))
+    return overrides, rejected
+
+
+def load_override_file(path=CA_OVERRIDE_FILE):
+    """
+    Repo-level shared overrides. Streamlit Cloud wipes the filesystem on every
+    redeploy, so this file is the only storage that survives - it is committed to
+    the repo, not written by the app.
+
+    Columns: symbol, ex_date, value[, note]. Missing file is not an error.
+    """
+    import os
+    if not os.path.exists(path):
+        return {}, []
+    try:
+        df = pd.read_csv(path, dtype=str).fillna("")
+    except Exception as e:
+        return {}, [(path, f"could not read: {e}")]
+    df.columns = [c.strip().lower() for c in df.columns]
+    if not {"symbol", "ex_date", "value"} <= set(df.columns):
+        return {}, [(path, "needs the columns symbol, ex_date, value")]
+    lines = "\n".join(f"{r['symbol']},{r['ex_date']},{r['value']}"
+                      for _, r in df.iterrows())
+    return parse_override_lines(lines)
+
+
+def override_csv_line(symbol, ex_date, value, note=""):
+    """The exact text to paste into ca_overrides.csv."""
+    return f"{str(symbol).upper()},{ex_date},{value},{note}"
+
+
+# -- attribution, risk, costs -------------------------------------------------
+
+def attribution(nav_rows, trades, dividends_paid=None):
+    """
+    Rupee contribution per symbol: realised + unrealised + dividends.
+
+    Realised P&L uses FIFO lots, so a symbol bought and sold repeatedly is not
+    flattered by netting average prices across separate holding periods.
+    """
+    from collections import deque
+
+    lots, realised, bought, sold = defaultdict(deque), defaultdict(float), \
+        defaultdict(float), defaultdict(float)
+    for t in sorted(trades, key=lambda x: (x["Date"], x["Side"] != "SELL")):
+        sym, qty, px = t["Symbol"], t["Qty"], t["Price"]
+        if t["Side"] == "BUY":
+            lots[sym].append([qty, px])
+            bought[sym] += qty * px
+        else:
+            sold[sym] += qty * px
+            left = qty
+            while left > 0 and lots[sym]:
+                lot = lots[sym][0]
+                take = min(left, lot[0])
+                realised[sym] += take * (px - lot[1])
+                lot[0] -= take
+                left -= take
+                if lot[0] <= 0:
+                    lots[sym].popleft()
+
+    last = nav_rows[-1]
+    div_by_sym = defaultdict(float)
+    for d in (dividends_paid or []):
+        div_by_sym[d["Symbol"]] += d["Amount"]
+
+    rows = []
+    for sym in sorted(set(list(realised) + list(last["_holdings"]) + list(div_by_sym))):
+        h = last["_holdings"].get(sym)
+        unreal = 0.0
+        if h:
+            cost = sum(q * p for q, p in lots[sym])
+            unreal = h["value"] - cost
+        total = realised[sym] + unreal + div_by_sym[sym]
+        rows.append(dict(Symbol=sym, Realised=round(realised[sym], 2),
+                         Unrealised=round(unreal, 2),
+                         Dividends=round(div_by_sym[sym], 2),
+                         Total=round(total, 2),
+                         Invested=round(bought[sym], 2),
+                         StillHeld="Yes" if h else "No"))
+    df = pd.DataFrame(rows)
+    if len(df):
+        base = nav_rows[0]["NAV"] if nav_rows else 1.0
+        df["ContributionPP"] = (df["Total"] / base * 100).round(2)
+        df = df.sort_values("Total", ascending=False).reset_index(drop=True)
+    return df
+
+
+def risk_stats(nav_rows, capital, key="NAV"):
+    """Drawdown, volatility, hit rate. key='NAV_TR' for the dividend basis."""
+    import math
+    navs = [r[key] for r in nav_rows]
+    dates = [r["Date"] for r in nav_rows]
+    if len(navs) < 2:
+        return {}
+
+    peak, peak_d, mdd, mdd_d, mdd_peak_d = navs[0], dates[0], 0.0, None, None
+    for d, v in zip(dates, navs):
+        if v > peak:
+            peak, peak_d = v, d
+        dd = (v / peak - 1) * 100
+        if dd < mdd:
+            mdd, mdd_d, mdd_peak_d = dd, d, peak_d
+
+    recovered = None
+    if mdd_d:
+        for d, v in zip(dates, navs):
+            if d > mdd_d and v >= max(n for dd, n in zip(dates, navs) if dd == mdd_peak_d):
+                recovered = (d - mdd_d).days
+                break
+
+    rets = [(navs[i] / navs[i - 1] - 1) for i in range(1, len(navs)) if navs[i - 1]]
+    mean = sum(rets) / len(rets) if rets else 0.0
+    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1) if len(rets) > 1 else 0.0
+    vol = math.sqrt(var) * math.sqrt(252) * 100
+    years = max((dates[-1] - dates[0]).days / 365.25, 1e-9)
+    cagr = ((navs[-1] / capital) ** (1 / years) - 1) * 100 if navs[-1] > 0 else 0.0
+    up = sum(1 for r in rets if r > 0)
+
+    return {
+        "Max drawdown %": round(mdd, 2),
+        "Drawdown trough": mdd_d.strftime("%d-%b-%Y") if mdd_d else "-",
+        "Peak before trough": mdd_peak_d.strftime("%d-%b-%Y") if mdd_peak_d else "-",
+        "Days to recover": str(recovered) if recovered is not None else "not yet",
+        "Annualised volatility %": round(vol, 2),
+        "CAGR %": round(cagr, 2),
+        "Return / max drawdown": round(abs(cagr / mdd), 2) if mdd else None,
+        "Positive days %": round(up / len(rets) * 100, 1) if rets else None,
+        "Best day %": round(max(rets) * 100, 2) if rets else None,
+        "Worst day %": round(min(rets) * 100, 2) if rets else None,
+    }
+
+
+def cost_impact(trades, nav_rows, capital, bps):
+    """
+    Brokerage as a drag on the final return.
+
+    Applied as a reporting overlay rather than deducted inside the engine, so
+    changing the rate never changes a share quantity and the two views stay
+    comparable.
+    """
+    turnover = sum(t["Value"] for t in trades)
+    cost = turnover * bps / 10000.0
+    final = nav_rows[-1]["NAV"] if nav_rows else capital
+    gross = (final / capital - 1) * 100
+    net = ((final - cost) / capital - 1) * 100
+    return {
+        "Two-sided turnover": round(turnover, 2),
+        "Turnover / capital %": round(turnover / capital * 100, 1),
+        "Brokerage rate (bps)": bps,
+        "Estimated cost": round(cost, 2),
+        "Gross return %": round(gross, 2),
+        "Net of brokerage %": round(net, 2),
+        "Cost drag pp": round(gross - net, 2),
+    }
+
+
+def cash_drag(nav_rows):
+    """Average cash weight and what full deployment would have added."""
+    if not nav_rows:
+        return {}
+    weights = [(r["Cash"] / r["NAV"] * 100) if r["NAV"] else 0.0 for r in nav_rows]
+    avg = sum(weights) / len(weights)
+
+    eq_growth = 1.0
+    for i in range(1, len(nav_rows)):
+        p, c = nav_rows[i - 1], nav_rows[i]
+        if p["MarketValue"] > 0 and not c["Type"] == "TRADE":
+            eq_growth *= (c["MarketValue"] / p["MarketValue"])
+    return {
+        "Average cash weight %": round(avg, 2),
+        "Peak cash weight %": round(max(weights), 2),
+        "Minimum cash weight %": round(min(weights), 2),
+        "Cash weight today %": round(weights[-1], 2),
+    }
