@@ -54,7 +54,7 @@ CAPITAL_OPTIONS = {
     "Rs 5,00,000": 500000, "Rs 10,00,000": 1000000, "Rs 25,00,000": 2500000,
     "Rs 50,00,000": 5000000,
 }
-DEFAULT_CAPITAL = "Rs 25,00,000"
+DEFAULT_CAPITAL = "Rs 2,50,000"
 BENCH_MAP = {"Nifty 50": "^NSEI", "Nifty 500": "^CRSLDX", "Sensex": "^BSESN"}
 
 
@@ -174,11 +174,15 @@ def ca_sample_days(sessions, every=3):
     return tuple(days)
 
 
-def to_excel(perf_df, nav_df, holdings_df, trades_df, alerts_df, recon_df,
-             wt_matrix, qty_matrix):
+def to_excel(perf_df, perf_tr_df, nav_df, holdings_df, trades_df, alerts_df,
+             recon_df, wt_matrix, qty_matrix, attrib_df, div_df, stats_df):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         perf_df.to_excel(w, sheet_name="Performance", index=False)
+        perf_tr_df.to_excel(w, sheet_name="Performance incl Div", index=False)
+        stats_df.to_excel(w, sheet_name="Risk and Costs", index=False)
+        attrib_df.to_excel(w, sheet_name="Contributors", index=False)
+        div_df.to_excel(w, sheet_name="Dividends", index=False)
         nav_df.to_excel(w, sheet_name="Daily NAV", index=False)
         holdings_df.to_excel(w, sheet_name="Final Holdings", index=False)
         wt_matrix.to_excel(w, sheet_name="Holdings Wt Matrix", index=False)
@@ -197,56 +201,110 @@ with st.sidebar:
                                  index=list(CAPITAL_OPTIONS).index(DEFAULT_CAPITAL))
     capital = CAPITAL_OPTIONS[capital_label]
 
-    start_override = st.date_input("Inception (advice before this date executes here)",
-                                   value=date(2025, 10, 20),
-                                   min_value=date(2015, 1, 1), max_value=date.today())
+    start_override = st.date_input(
+        "Start Date", value=date(2025, 10, 20),
+        min_value=date(2015, 1, 1), max_value=date.today(),
+        help="Day 1 of the NAV series - the date the client's money goes in. "
+             "The portfolio opens with the model's allocation as it stood on this "
+             "date; earlier advice is not replayed as trades. Those opening "
+             "positions fill at this date's closing price, since a client starting "
+             "today cannot buy at a price quoted weeks ago.")
     to_date = st.date_input("Calculate through", value=date.today(),
                             min_value=date(2015, 1, 1), max_value=date.today())
 
-    gate_pp = st.number_input("Rebalance gate (percentage points)", 0.0, 10.0, 1.0, 0.25,
-                              help="Trade only when |client weight - model weight| exceeds this.")
+    gate_pp = st.number_input(
+        "Rebalance Tolerance (percentage points)", 0.0, 10.0, 1.0, 0.25,
+        help="How far a holding may drift from its model weight before it is "
+             "traded back - in either direction. At 1pp, a 10% model position is "
+             "left alone anywhere between 9% and 11%. Outside that band it is "
+             "traded back to exactly 10%: trimmed if it has run up, topped up if "
+             "it has fallen behind.")
     force_retarget = st.checkbox(
-        "Re-target all holdings on event dates", value=True,
-        help="On. Every holding is checked against its model weight on any date "
-             "carrying a log row. Off = only symbols named in the log that date can trade.")
+        "Rebalance all holdings on advice dates", value=True,
+        help="On: whenever any advice is logged, every holding is checked against "
+             "its model weight, and any that has drifted beyond the tolerance is "
+             "traded back - even holdings that advice did not mention. Off: only "
+             "the symbols named in that day's advice can trade, and everything "
+             "else is left to drift until its own advice arrives.")
+
+    st.markdown("---")
+    st.markdown("### Income")
+    div_on = st.checkbox(
+        "Include dividends", value=True,
+        help="A stock's price falls by roughly the dividend on its ex-date, and "
+             "the exchange close already reflects that. This credits the cash the "
+             "client actually receives, so the two offset and the income is not "
+             "lost. Trade prices and quantities are never affected - results are "
+             "always shown on both bases, with and without dividends.")
 
     st.markdown("---")
     st.markdown("### Corporate actions")
-    ca_on = st.checkbox("Adjust for corporate actions", value=True,
-                        help="Fetches NSE's official CA calendar and restates the "
-                             "affected symbol's price series and log prices onto one "
-                             "basis. Dividends are never adjusted - this is a "
-                             "price-return framework.")
-    ca_mode = st.radio("Basis", ["pre_ex_down", "post_ex_up"], index=0,
-                       format_func=lambda m: ("Restate history (recommended)"
-                                              if m == "pre_ex_down"
-                                              else "Keep history, scale forward"),
-                       help="Both give the same return series. Restating history "
-                            "keeps post-ex trades at real prices, so share counts "
-                            "match a real client's.")
+    ca_on = st.checkbox(
+        "Adjust for corporate actions", value=True,
+        help="A split, bonus or demerger cuts the share price without the holder "
+             "losing anything. Left alone, that drop reads as a market loss - an "
+             "unadjusted 10:1 split looks like a 90% collapse. This fetches NSE's "
+             "official corporate-action calendar and restates the affected prices, "
+             "in the log as well as the price history, so the drop is not counted "
+             "as performance.")
+    ca_mode = st.radio(
+        "Basis", ["pre_ex_down", "post_ex_up"], index=0,
+        format_func=lambda m: ("Restate history (recommended)" if m == "pre_ex_down"
+                               else "Keep history, scale forward"),
+        help="Both give identical returns; they differ in the share count you end "
+             "up holding. Restate history rewrites prices from before the event "
+             "onto the post-event scale, so trades after it use real market prices "
+             "and the share count matches a real client's. Keep history leaves the "
+             "past untouched and inflates later prices instead, which holds NAV on "
+             "the old scale but makes post-event share counts synthetic.")
     dm_policy = st.radio(
         "Demergers", ["require", "gap"], index=0,
         format_func=lambda m: ("Require a factor (recommended)" if m == "require"
                                else "Approximate from the price gap"),
-        help="Splits and bonuses carry exact terms in NSE's file and are always "
-             "handled exactly. Demergers do not - the value split is only in the "
-             "scheme document. Approximating from the gap treats the day's genuine "
-             "market move as part of the action and overstates returns.")
-    ca_override_txt = st.text_area(
-        "Demerger factors", height=80,
-        placeholder="TRIVENI, 2026-07-22, -5.39%\nVEDL, 2026-04-30, 2.8412",
-        help="One per line: SYMBOL, EX-DATE, VALUE. Value is either the true "
-             "ex-date return (with a % sign) or an explicit price factor.")
-    ca_method = st.radio("Ex-date factor", ["gap", "index"], index=0, horizontal=True,
-                         format_func=lambda m: ("Price gap" if m == "gap"
-                                                else "Index-relative"),
-                         help="Price gap assumes the symbol's genuine return on the "
-                              "ex-date was 0%. Index-relative assumes it moved with "
-                              "the benchmark that day.")
+        help="Splits and bonuses state their exact terms in NSE's file, so they "
+             "are always handled precisely and never need input. Demergers do not "
+             "- how the value divided between the parent and the new company sits "
+             "only in the scheme document. Require a factor stops and asks you for "
+             "it. Approximate guesses from the size of the price drop, which "
+             "assumes the stock had no genuine move that day and overstates "
+             "returns whenever it did.")
 
-    benchmark = st.selectbox("Benchmark", ["None", "Nifty 50", "Nifty 500", "Sensex"],
-                             index=2,
-                             help="Drives both the chart overlay and the period performance table. Price return - the NSE bhavcopy is a price series.")
+    file_ov, file_rej = engine.load_override_file()
+    if file_ov:
+        st.caption("Loaded from `ca_overrides.csv`: "
+                   + ", ".join(f"{sym} {ex}" for sym, ex in sorted(file_ov)))
+    for bad, why in file_rej:
+        st.caption(f"`ca_overrides.csv` - {bad}: {why}")
+
+    ca_override_txt = st.text_area(
+        "Demerger factors (this run only)", height=80,
+        placeholder="TRIVENI, 2026-07-22, -5.39%",
+        help="One per line: SYMBOL, EX-DATE, VALUE. VALUE is either the stock's "
+             "genuine return on the ex-date written with a % sign, or an explicit "
+             "price factor. Entries here override anything in ca_overrides.csv. "
+             "To keep a factor permanently, commit it to that file - the copy "
+             "button below gives you the line.")
+    ca_method = st.radio(
+        "Ex-date factor", ["gap", "index"], index=0, horizontal=True,
+        format_func=lambda m: "Price gap" if m == "gap" else "Index-relative",
+        help="Only used when Demergers is set to Approximate. Price gap assumes "
+             "the stock's genuine return that day was 0%. Index-relative assumes "
+             "it moved in line with the benchmark.")
+
+    st.markdown("---")
+    st.markdown("### Costs")
+    brokerage_bps = st.number_input(
+        "Brokerage (bps per side)", 0.0, 100.0, 0.0, 1.0,
+        help="Applied to two-sided turnover as a reporting overlay. It never "
+             "changes a trade quantity, so gross and net stay comparable. "
+             "Set to 0 to ignore.")
+
+    benchmark = st.selectbox(
+        "Benchmark", ["None", "Nifty 50", "Nifty 500", "Sensex"], index=2,
+        help="Price return, matching the portfolio's price-return basis. Note "
+             "that a price index excludes its own constituents' dividends, so "
+             "outperformance measured on the dividend-inclusive basis is "
+             "flattered by roughly the index yield.")
 
     st.markdown("---")
     st.markdown("### Upload log")
@@ -309,7 +367,7 @@ Log parsed - <strong>{len(log_df)}</strong> rows
 
 params = (uploaded.name, capital, start_override, to_date, gate_pp,
           force_retarget, benchmark, ca_on, ca_mode, ca_method,
-          dm_policy, ca_override_txt)
+          dm_policy, ca_override_txt, div_on, brokerage_bps)
 if run_btn:
     st.session_state["nav_run"] = True
 if st.session_state.get("nav_params") != params:
@@ -334,57 +392,46 @@ if "nav_results" not in st.session_state:
         st.stop()
     bench = benchmark_series(closes, benchmark, start_override, to_date)
 
-    ca_overrides, ca_bad = {}, []
-    for line in (ca_override_txt or "").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        parts = [x.strip() for x in line.split(",")]
-        if len(parts) != 3:
-            ca_bad.append((line, "expected SYMBOL, EX-DATE, VALUE"))
-            continue
-        sym_o, ex_o, val_o = parts
-        ex_d = engine.parse_date(ex_o)
-        if ex_d is None:
-            ca_bad.append((line, f"could not parse the date '{ex_o}'"))
-            continue
-        try:
-            if val_o.endswith("%"):
-                ca_overrides[(sym_o.upper(), ex_d)] = {
-                    "true_ret": float(val_o.rstrip("%")) / 100.0}
-            else:
-                ca_overrides[(sym_o.upper(), ex_d)] = float(val_o)
-        except ValueError:
-            ca_bad.append((line, f"could not parse the value '{val_o}'"))
+    ca_overrides, ca_bad = engine.load_override_file()
+    typed, typed_bad = engine.parse_override_lines(ca_override_txt)
+    ca_overrides.update(typed)
+    ca_bad += typed_bad
 
-    ca_alerts, ca_actions = [], []
-    for line, why in ca_bad:
+    ca_alerts, ca_actions, dividends, div_paid = [], [], {}, []
+    for bad, why in ca_bad:
         ca_alerts.append(dict(Date=None, Symbol="-", Type="CA OVERRIDE IGNORED",
-                              Detail=f"{line} - {why}"))
-    if ca_on:
+                              Detail=f"{bad} - {why}"))
+
+    if ca_on or div_on:
         with st.spinner("Fetching NSE corporate-action calendar..."):
+            held = set(log_df.loc[~log_df["is_liquid"], "symbol"])
             ca_actions = [a for a in fetch_ca(ca_sample_days(sorted(closes)))
-                          if a["Symbol"] in set(log_df.loc[~log_df["is_liquid"], "symbol"])]
+                          if a["Symbol"] in held]
+    if ca_on:
         closes, log_df, applied = engine.apply_corporate_actions(
             closes, log_df, ca_actions, mode=ca_mode, method=ca_method, bench=bench,
             overrides=ca_overrides, demerger_policy=dm_policy)
         ca_alerts += applied
+    if div_on:
+        dividends, div_alerts = engine.build_dividends(ca_actions, held)
+        ca_alerts += div_alerts
     ca_alerts += engine.gap_detector(closes, log_df, ca_actions, threshold_pct=20.0)
 
     with st.spinner("Running the NAV engine..."):
         try:
-            nav_rows, trades, alerts = engine.run_nav(
+            nav_rows, trades, alerts, div_paid = engine.run_nav(
                 log_df, closes, capital, start_override, to_date,
-                gate_pp=gate_pp, force_retarget=force_retarget)
+                gate_pp=gate_pp, force_retarget=force_retarget, dividends=dividends)
         except ValueError as e:
             st.markdown(f'<div class="err">{e}</div>', unsafe_allow_html=True)
             st.stop()
+
     for d, err in sorted(fetch_errors.items()):
         alerts.append(dict(Date=d, Symbol="-", Type="BHAVCOPY FETCH ERROR", Detail=err))
     alerts = ca_alerts + alerts
-    st.session_state["nav_results"] = (nav_rows, trades, alerts, bench)
+    st.session_state["nav_results"] = (nav_rows, trades, alerts, bench, div_paid)
 
-nav_rows, trades, alerts, bench = st.session_state["nav_results"]
+nav_rows, trades, alerts, bench, div_paid = st.session_state["nav_results"]
 
 nav_df = pd.DataFrame([{k: v for k, v in r.items() if k != "_holdings"} for r in nav_rows])
 trades_df = pd.DataFrame(trades) if trades else pd.DataFrame(
@@ -394,12 +441,21 @@ alerts_df = pd.DataFrame(alerts) if alerts else pd.DataFrame(
 recon_df = engine.reconciliation(nav_rows)
 wt_matrix = engine.holdings_matrix(nav_rows, "weight")
 qty_matrix = engine.holdings_matrix(nav_rows, "qty")
-perf_df = engine.period_returns(nav_rows, capital, bench,
-                                benchmark if benchmark != "None" else "Benchmark")
+bname = benchmark if benchmark != "None" else "Benchmark"
+perf_df = engine.period_returns(nav_rows, capital, bench, bname)
+perf_tr_df = engine.period_returns(nav_rows, capital, bench, bname, key="NAV_TR")
+attrib_df = engine.attribution(nav_rows, trades, div_paid)
+div_df = pd.DataFrame(div_paid) if div_paid else pd.DataFrame(
+    columns=["Date", "Symbol", "DPS", "Qty", "Amount"])
+risk = engine.risk_stats(nav_rows, capital)
+costs = engine.cost_impact(trades, nav_rows, capital, brokerage_bps)
+cashd = engine.cash_drag(nav_rows)
 
 last, first = nav_rows[-1], nav_rows[0]
 total_return = (last["NAV"] - capital) / capital * 100
+total_return_tr = (last["NAV_TR"] - capital) / capital * 100
 abs_pl = last["NAV"] - capital
+div_total = last["DividendCash"]
 
 # -- alerts (first, never buried) ---------------------------------------------
 
@@ -435,7 +491,8 @@ kpi(cols[2], "Rebased NAV", f"{last['Rebased']:.2f}",
 kpi(cols[3], "Absolute return", fmt_pct(total_return),
     "gain" if total_return >= 0 else "loss")
 kpi(cols[4], "Absolute P&L", fmt_inr(abs_pl), "gain" if abs_pl >= 0 else "loss")
-kpi(cols[5], "Sessions", f"{len(nav_rows)}")
+kpi(cols[5], "Return incl. dividends", fmt_pct(total_return_tr),
+    "gain" if total_return_tr >= 0 else "loss")
 
 st.markdown("<br>", unsafe_allow_html=True)
 
@@ -443,14 +500,22 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 st.markdown(f"#### Performance vs benchmark &mdash; as of {last['Date']:%d %b %Y}")
 bcol = f"{benchmark} %" if benchmark != "None" else "Benchmark %"
+basis = st.radio("Basis", ["Excluding dividends", "Including dividends"],
+                 horizontal=True, key="perf_basis")
+_pf = perf_df if basis == "Excluding dividends" else perf_tr_df
 st.dataframe(
-    perf_df, use_container_width=True, hide_index=True,
+    _pf, use_container_width=True, hide_index=True,
     column_config={
         "Days": st.column_config.NumberColumn(format="%d"),
         "Portfolio %": st.column_config.NumberColumn(format="%.2f"),
         bcol: st.column_config.NumberColumn(format="%.2f"),
         "Outperf pp": st.column_config.NumberColumn(format="%.2f"),
     })
+if basis == "Including dividends":
+    st.caption(f"Dividends received: {fmt_inr(div_total)} "
+               f"({total_return_tr - total_return:+.2f}pp). The benchmark remains a "
+               "price index, which excludes its own constituents' dividends, so "
+               "outperformance on this basis is flattered by roughly the index yield.")
 note = ("Point-to-point price returns, both legs. Base session is the last session "
         "on or before each period anchor; periods starting before inception show n/a. "
         f"Cash weight on {last['Date']:%d %b %Y} is "
@@ -466,6 +531,7 @@ st.markdown("<br>", unsafe_allow_html=True)
 
 dates_plot = [r["Date"] for r in nav_rows]
 rebased = [r["Rebased"] for r in nav_rows]
+rebased_tr = [r["Rebased_TR"] for r in nav_rows]
 
 fig = go.Figure()
 fig.add_trace(go.Scatter(x=dates_plot, y=rebased, name="Portfolio NAV",
@@ -473,6 +539,10 @@ fig.add_trace(go.Scatter(x=dates_plot, y=rebased, name="Portfolio NAV",
                          hovertemplate="<b>%{x}</b><br>NAV: %{y:.4f}"
                                        "<br>Return: %{customdata:.2f}%<extra></extra>",
                          customdata=[v - 100 for v in rebased]))
+if div_total > 0:
+    fig.add_trace(go.Scatter(x=dates_plot, y=rebased_tr, name="NAV incl. dividends",
+                             line=dict(color="#1A8F4F", width=1.5, dash="dash"),
+                             hovertemplate="<b>%{x}</b><br>incl. div: %{y:.4f}<extra></extra>"))
 tr_dates = [r["Date"] for r in nav_rows if r["Type"] == "TRADE"]
 tr_vals = [r["Rebased"] for r in nav_rows if r["Type"] == "TRADE"]
 fig.add_trace(go.Scatter(x=tr_dates, y=tr_vals, mode="markers", name="Event day",
@@ -534,8 +604,11 @@ with col_s:
         "Cash": fmt_inr(last["Cash"]),
         "Cash weight": f"{cash_pct:.2f}%",
         "Total NAV": fmt_inr(last["NAV"]),
-        "Absolute return": fmt_pct(total_return),
+        "Absolute return (excl. div)": fmt_pct(total_return),
+        "Absolute return (incl. div)": fmt_pct(total_return_tr),
+        "Dividends received": fmt_inr(div_total),
         "Absolute P&L": fmt_inr(abs_pl),
+        "Max drawdown": f"{risk.get('Max drawdown %', 0):.2f}%",
         "Starting capital": fmt_inr(capital),
         "Sessions": str(len(nav_rows)),
         "Event dates": str(sum(1 for r in nav_rows if r["Type"] == "TRADE")),
@@ -551,8 +624,62 @@ with col_s:
 # -- tables -------------------------------------------------------------------
 
 st.markdown("---")
-tab_nav, tab_book, tab_matrix, tab_trades, tab_recon = st.tabs(
-    ["Daily NAV", "Holdings on a date", "Holdings matrix", "Trades", "Reconciliation"])
+(tab_attr, tab_risk, tab_nav, tab_book, tab_matrix,
+ tab_trades, tab_div, tab_recon) = st.tabs(
+    ["Contributors", "Risk & costs", "Daily NAV", "Holdings on a date",
+     "Holdings matrix", "Trades", "Dividends", "Reconciliation"])
+
+with tab_attr:
+    if len(attrib_df):
+        top = attrib_df.head(10)
+        bot = attrib_df.tail(10).iloc[::-1]
+        ca, cb = st.columns(2)
+        with ca:
+            st.markdown("**Key contributors**")
+            st.dataframe(top, use_container_width=True, hide_index=True, height=380)
+        with cb:
+            st.markdown("**Key detractors**")
+            st.dataframe(bot, use_container_width=True, hide_index=True, height=380)
+        st.caption("Realised P&L uses FIFO lots, so a symbol traded in and out "
+                   "repeatedly is not flattered by averaging across separate "
+                   "holding periods. ContributionPP is the rupee total as a "
+                   "percentage of starting capital; the column sums to the "
+                   "portfolio's total P&L including dividends.")
+    else:
+        st.info("No closed or open positions to attribute.")
+
+with tab_risk:
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        st.markdown("**Risk**")
+        st.dataframe(pd.DataFrame(list(risk.items()), columns=["Metric", "Value"]),
+                     use_container_width=True, hide_index=True, height=420)
+    with r2:
+        st.markdown("**Turnover & cost**")
+        st.dataframe(pd.DataFrame(list(costs.items()), columns=["Metric", "Value"]),
+                     use_container_width=True, hide_index=True, height=300)
+        if brokerage_bps == 0:
+            st.caption("Set a brokerage rate in the sidebar to see the cost drag.")
+    with r3:
+        st.markdown("**Cash**")
+        st.dataframe(pd.DataFrame(list(cashd.items()), columns=["Metric", "Value"]),
+                     use_container_width=True, hide_index=True, height=300)
+        st.caption("Cash earns nothing in this model. A high average cash weight "
+                   "is a real drag on returns relative to a fully invested index.")
+
+with tab_div:
+    if len(div_df):
+        st.dataframe(div_df.iloc[::-1].reset_index(drop=True),
+                     use_container_width=True, hide_index=True, height=380)
+        st.caption(f"Total {fmt_inr(div_total)} across {len(div_df)} events "
+                   f"({total_return_tr - total_return:+.2f}pp). Credited to cash on "
+                   "the ex-date; trade prices and quantities are unaffected. "
+                   "Duplicate listings of the same dividend across NSE series are "
+                   "suppressed and flagged in the alert table.")
+    elif div_on:
+        st.info("No dividends fell on a date when the relevant stock was held.")
+    else:
+        st.info("Dividends are switched off in the sidebar.")
 
 with tab_nav:
     flt = st.selectbox("Rows", ["All", "Event days only", "MTM days only"], key="navflt")
@@ -570,7 +697,12 @@ with tab_nav:
                      "Cash": st.column_config.NumberColumn(format="%.2f"),
                      "NAV": st.column_config.NumberColumn(format="%.2f"),
                      "DayPL": st.column_config.NumberColumn(format="%.2f"),
+                     "NAV_TR": st.column_config.NumberColumn(format="%.2f"),
+                     "Rebased_TR": st.column_config.NumberColumn(format="%.4f"),
+                     "DividendCash": st.column_config.NumberColumn(format="%.2f"),
                  })
+    st.caption("NAV excludes dividends; NAV_TR includes them. DividendCash is the "
+               "running total received.")
 
 with tab_book:
     sessions = [r["Date"] for r in nav_rows]
@@ -619,17 +751,36 @@ with tab_recon:
 
 # -- export -------------------------------------------------------------------
 
+ca_applied = [a for a in alerts if a["Type"].startswith("CORPORATE ACTION - ADJUSTED")]
+if ca_applied or [a for a in alerts if "FACTOR REQUIRED" in a["Type"]]:
+    with st.expander("Save corporate-action factors permanently", expanded=False):
+        st.markdown(
+            "Streamlit Cloud wipes its filesystem on every redeploy, so the app "
+            "cannot save these itself. Commit the lines below to `ca_overrides.csv` "
+            "at the repo root and every future run - for everyone - picks them up "
+            "automatically.")
+        lines = ["symbol,ex_date,value,note"]
+        for k, v in sorted(engine.parse_override_lines(ca_override_txt)[0].items()):
+            raw = v["true_ret"] * 100 if isinstance(v, dict) else v
+            val = f"{raw:+.2f}%" if isinstance(v, dict) else f"{raw}"
+            lines.append(engine.override_csv_line(k[0], k[1], val, "demerger"))
+        st.code("\n".join(lines), language="csv")
+
 st.markdown("---")
 if "nav_excel" not in st.session_state:
-    st.session_state["nav_excel"] = to_excel(perf_df, nav_df, holdings_export,
-                                             trades_df, alerts_df, recon_df,
-                                             wt_matrix, qty_matrix)
+    stats_df = pd.DataFrame(
+        [{"Section": "Risk", "Metric": k, "Value": v} for k, v in risk.items()]
+        + [{"Section": "Cost", "Metric": k, "Value": v} for k, v in costs.items()]
+        + [{"Section": "Cash", "Metric": k, "Value": v} for k, v in cashd.items()])
+    st.session_state["nav_excel"] = to_excel(
+        perf_df, perf_tr_df, nav_df, holdings_export, trades_df, alerts_df,
+        recon_df, wt_matrix, qty_matrix, attrib_df, div_df, stats_df)
     st.session_state["nav_csv"] = nav_df.to_csv(index=False).encode()
 
 stem = uploaded.name.rsplit(".", 1)[0]
 e1, e2 = st.columns(2)
 with e1:
-    st.download_button("Download Excel (8 sheets: performance, NAV, holdings, matrices, trades, alerts, recon)",
+    st.download_button("Download Excel - full workbook",
                        data=st.session_state["nav_excel"],
                        file_name=f"NAV_{stem}_{to_date:%d%b%Y}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument."
