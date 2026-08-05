@@ -1,0 +1,13 @@
+# Place at .streamlit/config.toml in the repo root.
+# Mirrors PALETTE in pages/nav_calculator.py - if one changes, change both or the
+# Streamlit chrome will not match the custom cards.
+[theme]
+base = "light"
+primaryColor = "#1E4FD8"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F7F8FA"
+textColor = "#12161F"
+font = "sans serif"
+
+[server]
+maxUploadSize = 200
