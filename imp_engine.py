@@ -54,6 +54,8 @@ ALERT_NEG_CASH = "NEGATIVE CASH"
 ALERT_NO_CLOSE = "NO EOD CLOSE"
 ALERT_STALE_PX = "PRE-START ADVICE - REPRICED"
 ALERT_DIVIDEND = "DIVIDEND CREDITED"
+ALERT_ROLLED_DATE = "ADVICE DATE ROLLED"
+ALERT_ORPHAN_DATE = "ADVICE DATE ORPHANED"
 
 
 def is_liquid(symbol: str) -> bool:
@@ -279,6 +281,41 @@ def run_nav(log, closes, capital, start, to_date,
     calendar = [d for d in sorted(closes) if start <= d <= to_date]
     if not calendar:
         raise ValueError("No NSE trading sessions in the selected range.")
+
+    # Advice dated on a non-trading day must roll forward to the next session.
+    # The RAs log rebalances on Sundays. Because the day loop iterates `calendar`
+    # (NSE sessions only), such an event was previously never reached and the whole
+    # date was discarded in silence - no trade, no alert. On the reference logs
+    # that lost 18 instructions on Sunday 01-Mar-2026, including two full exits,
+    # leaving the positions in the book to the end of the run.
+    sessions = set(calendar)
+    rolled = defaultdict(dict)
+    for d, syms in sorted(events.items()):
+        if d in sessions:
+            rolled[d].update(syms)
+            continue
+        nxt = next((s for s in calendar if s > d), None)
+        if nxt is None:
+            alerts.append(dict(
+                Date=d, Symbol="-", Type=ALERT_ORPHAN_DATE,
+                Detail=(f"advice dated {d} ({d:%a}) is not an NSE session and no "
+                        f"later session exists in range - {len(syms)} symbol(s) "
+                        f"NOT applied")))
+            continue
+        alerts.append(dict(
+            Date=d, Symbol="-", Type=ALERT_ROLLED_DATE,
+            Detail=(f"advice dated {d} ({d:%a}) is not an NSE session - "
+                    f"{len(syms)} symbol(s) applied at the next session {nxt}")))
+        # Re-stamp the advice date to `nxt`, not the original non-session date.
+        # The day-loop's stale-price branch below fires on `adv != day` - the
+        # same signal the pre-start clamp uses to justify substituting the EOD
+        # close for the log price. Left as the original Sunday/holiday date,
+        # every rolled instruction would misfire that branch on arrival and
+        # silently lose its log price, contradicting the confirmed rule that a
+        # rolled date executes at the log price unchanged (falling back to the
+        # EOD close only via ALERT_ZERO_PX, when the log price is 0/blank).
+        rolled[nxt].update({sym: (wt, px, nxt) for sym, (wt, px, _adv) in syms.items()})
+    events = dict(rolled)
 
     model, portfolio, last_px, seen_missing = {}, {}, {}, set()
     cash = float(capital)
