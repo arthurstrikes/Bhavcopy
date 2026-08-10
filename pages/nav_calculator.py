@@ -14,6 +14,7 @@ at 8%, tint30 -> primary at 30%.
 Streamlit 1.39.0 API only - use_container_width, never width=.
 """
 
+import hashlib
 import io
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
@@ -83,9 +84,10 @@ h1,h2,h3,h4,h5 {{ font-family:'Plus Jakarta Sans','Inter',sans-serif; }}
 .block-container {{ padding-top:2.2rem; padding-bottom:3rem; max-width:1400px; }}
 
 /* report header */
-.rh-title {{ font-family:'Plus Jakarta Sans',sans-serif; font-size:1.55rem;
-             font-weight:700; color:var(--ink); letter-spacing:-.02em;
-             line-height:1.15; margin:0; }}
+.rh-title {{ font-family:'Plus Jakarta Sans','Inter',-apple-system,
+                        BlinkMacSystemFont,'Segoe UI',sans-serif;
+            font-size:1.55rem; font-weight:700; color:var(--ink);
+            letter-spacing:-.02em; line-height:1.3; padding-top:2px; margin:0; }}
 .rh-strip {{ display:flex; flex-wrap:wrap; gap:0 var(--s4); margin:var(--s2) 0 var(--s4);
              padding-bottom:var(--s3); border-bottom:1px solid var(--rule); }}
 .rh-item {{ display:flex; flex-direction:column; gap:2px; }}
@@ -154,6 +156,13 @@ CAPITAL_OPTIONS = {
 }
 DEFAULT_CAPITAL = "Rs 2,50,000"
 BENCH_MAP = {"Nifty 50": "^NSEI", "Nifty 500": "^CRSLDX", "Sensex": "^BSESN"}
+
+
+class _PastedLog(io.BytesIO):
+    """Wraps a text-area paste as a file-like object so engine.load_log() -
+    which already sniffs tab-separated text via _read_csv_any_delimiter -
+    handles it identically to an uploaded file. Only `.name` needs to exist."""
+    name = "pasted_log.csv"
 
 
 def fmt_inr(v):
@@ -359,7 +368,7 @@ with st.sidebar:
     portfolio_name = st.text_input(
         "Name", value="", placeholder="e.g. MO Technical Focus",
         help="Used in the page header, the factsheet and the export filenames. "
-             "Falls back to the uploaded file name when left blank.")
+             "Falls back to the uploaded file name, or \"pasted log\", when left blank.")
     capital_label = st.selectbox("Starting capital", list(CAPITAL_OPTIONS),
                                  index=list(CAPITAL_OPTIONS).index(DEFAULT_CAPITAL))
     capital = CAPITAL_OPTIONS[capital_label]
@@ -459,23 +468,42 @@ with st.sidebar:
              "changes a trade quantity, so gross and net stay comparable.")
 
     st.markdown("### Advice log")
-    uploaded = st.file_uploader("Upload", type=["csv", "xlsx", "xls"],
-                                label_visibility="collapsed",
-                                help="CSV or XLSX. Delimiter and columns auto-detected.")
+    src = st.radio("Source", ["Upload file", "Paste rows"], horizontal=True,
+                   label_visibility="collapsed", key="log_src")
+    uploaded, pasted = None, ""
+    if src == "Upload file":
+        uploaded = st.file_uploader("Upload", type=["csv", "xlsx", "xls"],
+                                    label_visibility="collapsed",
+                                    help="CSV or XLSX. Delimiter and columns "
+                                         "auto-detected.")
+    else:
+        pasted = st.text_area(
+            "Paste", height=150, label_visibility="collapsed",
+            placeholder="Paste rows copied from Excel, including the header row.",
+            help="Copy the log rows in Excel and paste here. Excel copies as "
+                 "tab-separated text, which the parser already detects.")
+        if pasted.strip():
+            st.caption(f"{len(pasted.strip().splitlines()) - 1} data row(s) detected")
+
+    log_source = uploaded
+    if src == "Paste rows" and pasted.strip():
+        log_source = _PastedLog(pasted.encode("utf-8"))
+
     run_btn = st.button("Calculate NAV", type="primary", use_container_width=True,
-                        disabled=uploaded is None)
+                        disabled=log_source is None)
     st.caption("IMP NAV Calculator v3.0")
 
 # -- landing ------------------------------------------------------------------
 
-if uploaded is None:
+if log_source is None:
     st.markdown('<div class="rh-title">NAV Calculator</div>', unsafe_allow_html=True)
     st.markdown('<div class="rh-strip"><div class="rh-item"><span class="rh-k">'
                 'Model portfolio simulation</span><span class="rh-v">Daily rebased '
                 'NAV &middot; target-weight rebalancing &middot; official NSE closing '
                 'prices</span></div></div>', unsafe_allow_html=True)
-    st.markdown('<div class="note"><strong>Upload an advice log to begin.</strong><br>'
-                'CSV or XLSX. Delimiter and column structure are detected '
+    st.markdown('<div class="note"><strong>Upload or paste an advice log to begin.'
+                '</strong><br>CSV or XLSX (upload), or tab-separated rows copied '
+                'from Excel (paste). Delimiter and column structure are detected '
                 'automatically.</div>', unsafe_allow_html=True)
     with st.expander("How it works"):
         st.markdown("""
@@ -499,23 +527,33 @@ move; the tolerance filters them out by construction.
 **Cash** is idle allocation plus any LIQUIDCASE / liquid-ETF weight, held as one
 pool earning nothing. Negative cash is permitted and always alerted.
 
+**Dividends** are credited to cash on the ex-date; trade prices are never
+adjusted. Results are shown both including and excluding dividends throughout.
+
 **Corporate actions** are read from NSE's official calendar. Splits and bonuses are
 exact; demergers require a factor you supply, because the terms sit only in the
-scheme document.
+scheme document - either in the sidebar for a single run, or in `ca_overrides.csv`
+at the repo root so it applies to every future run.
         """)
     st.stop()
 
 # -- parse --------------------------------------------------------------------
 
-log_df, parse_err = engine.load_log(uploaded)
+log_df, parse_err = engine.load_log(log_source)
 if parse_err:
     st.markdown(f'<div class="err">{parse_err}</div>', unsafe_allow_html=True)
     st.stop()
 
-pname = portfolio_name.strip() or uploaded.name.rsplit(".", 1)[0].replace("_", " ")
+pname = portfolio_name.strip() or log_source.name.rsplit(".", 1)[0].replace("_", " ")
 eq_log = log_df[~log_df["is_liquid"]]
 
-params = (uploaded.name, capital, start_override, to_date, gate_pp, force_retarget,
+# Cache-key caution: hash the paste, never the raw string - log_source.name is
+# a constant for every paste ("pasted_log.csv"), so it can't distinguish two
+# different pastes, and re-hashing a large paste on every widget change is
+# wasted work. Uploads keep the filename; it already changes with the file.
+log_key = uploaded.name if src == "Upload file" else hashlib.md5(pasted.encode()).hexdigest()
+
+params = (log_key, capital, start_override, to_date, gate_pp, force_retarget,
           benchmark, ca_on, ca_mode, ca_method, dm_policy, ca_override_txt,
           div_on, brokerage_bps)
 if run_btn:
@@ -560,7 +598,7 @@ if "nav_results" not in st.session_state:
     ca_overrides.update(typed)
     ca_bad += typed_bad
 
-    ca_alerts, ca_actions, dividends, div_paid = [], [], {}, []
+    ca_alerts, ca_actions, dividends, div_paid, div_dup_suppressed = [], [], {}, [], 0
     for bad, why in ca_bad:
         ca_alerts.append(dict(Date=None, Symbol="-", Type="CA OVERRIDE IGNORED",
                               Detail=f"{bad} - {why}"))
@@ -576,7 +614,7 @@ if "nav_results" not in st.session_state:
             overrides=ca_overrides, demerger_policy=dm_policy)
         ca_alerts += applied
     if div_on:
-        dividends, div_alerts = engine.build_dividends(ca_actions, held)
+        dividends, div_alerts, div_dup_suppressed = engine.build_dividends(ca_actions, held)
         ca_alerts += div_alerts
     ca_alerts += engine.gap_detector(closes, log_df, ca_actions, threshold_pct=20.0)
 
@@ -592,9 +630,9 @@ if "nav_results" not in st.session_state:
     for d, err in sorted(fetch_errors.items()):
         alerts.append(dict(Date=d, Symbol="-", Type="BHAVCOPY FETCH ERROR", Detail=err))
     st.session_state["nav_results"] = (nav_rows, trades, ca_alerts + alerts,
-                                       bench, div_paid)
+                                       bench, div_paid, div_dup_suppressed)
 
-nav_rows, trades, alerts, bench, div_paid = st.session_state["nav_results"]
+nav_rows, trades, alerts, bench, div_paid, div_dup_suppressed = st.session_state["nav_results"]
 
 nav_df = pd.DataFrame([{k: v for k, v in r.items() if k != "_holdings"}
                        for r in nav_rows])
@@ -607,7 +645,8 @@ wt_matrix = engine.holdings_matrix(nav_rows, "weight")
 qty_matrix = engine.holdings_matrix(nav_rows, "qty")
 bname = benchmark if benchmark != "None" else "Benchmark"
 perf_df = engine.period_returns(nav_rows, capital, bench, bname)
-perf_tr_df = engine.period_returns(nav_rows, capital, bench, bname, key="NAV_TR")
+perf_tr_df = engine.period_returns(nav_rows, capital, bench, bname, key="NAV_TR",
+                                   div_events=div_paid)
 attrib_df = engine.attribution(nav_rows, trades, div_paid)
 div_df = pd.DataFrame(div_paid) if div_paid else pd.DataFrame(
     columns=["Date", "Symbol", "DPS", "Qty", "Amount"])
@@ -938,8 +977,10 @@ with tab_div:
                      use_container_width=True, hide_index=True, height=380)
         st.caption(f"Total {fmt_inr(div_total)} across {len(div_df)} events "
                    f"({total_return_tr - total_return:+.2f} pp). Credited to cash on "
-                   "the ex-date; trade prices and quantities are unaffected. "
-                   "Duplicate listings across NSE series are suppressed and flagged.")
+                   "the ex-date; trade prices and quantities are unaffected.")
+        if div_dup_suppressed:
+            st.caption(f"{div_dup_suppressed} duplicate NSE series listing"
+                       f"{'s' if div_dup_suppressed != 1 else ''} removed.")
     elif div_on:
         st.info("No dividends fell on a date when the relevant stock was held.")
     else:
