@@ -155,7 +155,27 @@ CAPITAL_OPTIONS = {
     "Rs 50,00,000": 5000000,
 }
 DEFAULT_CAPITAL = "Rs 2,50,000"
-BENCH_MAP = {"Nifty 50": "^NSEI", "Nifty 500": "^CRSLDX", "Sensex": "^BSESN"}
+
+# Indices resolved natively via nse_bhavcopy.INDEX_ALIASES (verified against a
+# live NSE index bhavcopy file before being added - see resolve_index_name).
+# Anything NOT in this list falls through to BENCH_MAP / yfinance below.
+NSE_NATIVE_BENCHMARKS = [
+    "Nifty 50", "Nifty 100", "Nifty 200", "Nifty 500", "Nifty Total Market",
+    "Nifty Midcap 100", "Nifty Midcap 150", "Nifty Smallcap 100",
+    "Nifty Smallcap 250", "Nifty LargeMidcap 250", "Nifty MidSmallcap 400",
+    "Nifty200 Momentum 30",
+]
+
+# BSE indices are not published by NSE and stay on yfinance permanently (see
+# nse_bhavcopy.py). ^BSE500 is UNVERIFIED from this build environment - Yahoo
+# Finance access was blocked in the sandbox used to build this, so the ticker
+# could not be tested end-to-end. Confirm it resolves on first live use; if it
+# returns no data, check the correct BSE 500 ticker on Yahoo Finance directly
+# and update BENCH_MAP.
+BENCH_MAP = {
+    "Sensex": "^BSESN",
+    "BSE 500": "^BSE500",  # UNVERIFIED - confirm on first live use
+}
 
 
 class _PastedLog(io.BytesIO):
@@ -228,12 +248,14 @@ def benchmark_series(closes, name, start, end):
     nse_bhavcopy.fetch_day returns equities and indices merged, so every index
     close is present from the first pass. Re-fetching cost a second full sweep
     of the archive and, when that sweep hiccuped, silently fell through to
-    yfinance - which rate-limits Streamlit Cloud's shared IPs. Only Sensex needs
-    the network, being a BSE index NSE does not publish.
+    yfinance - which rate-limits Streamlit Cloud's shared IPs. Names in
+    BENCH_MAP (Sensex, BSE 500) need the network, being BSE indices NSE does
+    not publish - matched by dict membership, not a hardcoded name, so a new
+    BSE index only needs adding to BENCH_MAP, not a second branch here.
     """
     if name == "None":
         return {}
-    if name == "Sensex":
+    if name in BENCH_MAP:
         try:
             df = yf.download(BENCH_MAP[name], start=start.strftime("%Y-%m-%d"),
                              end=(end + timedelta(days=2)).strftime("%Y-%m-%d"),
@@ -456,16 +478,23 @@ with st.sidebar:
         help="Only used when Demergers is set to Approximate.")
 
     st.markdown("### Comparison and costs")
+    _bench_options = (["None"] + NSE_NATIVE_BENCHMARKS
+                      + ["Sensex", "BSE 500"])
     benchmark = st.selectbox(
-        "Benchmark", ["None", "Nifty 50", "Nifty 500", "Sensex"], index=2,
+        "Benchmark", _bench_options,
+        index=_bench_options.index("Nifty 500"),
         help="Price return, matching the portfolio's price-return basis. A price "
              "index excludes its own constituents' dividends, so outperformance "
              "measured on the dividend-inclusive basis is flattered by roughly "
-             "the index yield.")
-    brokerage_bps = st.number_input(
-        "Brokerage (bps per side)", 0.0, 100.0, 0.0, 1.0,
-        help="Applied to two-sided turnover as a reporting overlay. It never "
-             "changes a trade quantity, so gross and net stay comparable.")
+             "the index yield. Nifty-family indices are fetched from NSE's own "
+             "archive; Sensex and BSE 500 use a yfinance fallback since NSE "
+             "does not publish BSE indices.")
+    brokerage_pct = st.number_input(
+        "Brokerage (% per side)", 0.00, 5.00, 0.00, 0.01, format="%.2f",
+        help="Enter as a percentage, e.g. 0.20 for 0.20%. Applied to two-sided "
+             "turnover as a reporting overlay. It never changes a trade quantity, "
+             "so gross and net stay comparable.")
+    brokerage_bps = brokerage_pct * 100.0
 
     st.markdown("### Advice log")
     src = st.radio("Source", ["Upload file", "Paste rows"], horizontal=True,
@@ -707,23 +736,70 @@ with kc:
                      f'<div class="kpi-lbl">{lbl}</div></div>',
                      unsafe_allow_html=True)
 
-    if len(alerts_df):
-        ncat = alerts_df["Type"].nunique()
+    # Alert types that can plausibly move NAV/return vs types that are purely an
+    # audit trail (the engine checked something and took no action). Kept as an
+    # explicit allowlist so a new alert type defaults to "needs attention" rather
+    # than silently disappearing into the audit tier if this list is not updated.
+    IMPACT_ALERTS = {
+        "CHAIN UNRESOLVED", "FORCED REBALANCE (no log row)", "LOG PRICE ZERO",
+        "NO PRICE - TRADE SKIPPED", "NEGATIVE CASH",
+        "BUY UNDERFILLED - INSUFFICIENT CASH", "NO EOD CLOSE",
+        "PRE-START ADVICE - REPRICED", "ADVICE DATE ROLLED",
+        "ADVICE DATE ORPHANED", "UNEXPLAINED PRICE GAP",
+        "CORPORATE ACTION - CANNOT ADJUST", "CORPORATE ACTION - FACTOR REQUIRED",
+        "DIVIDEND NOT PARSED",
+        "CA OVERRIDE IGNORED", "BHAVCOPY FETCH ERROR",
+    }
+    n_impact = int(alerts_df["Type"].isin(IMPACT_ALERTS).sum()) if len(alerts_df) else 0
+
+    if n_impact:
         st.markdown(f'<div style="margin-top:12px"><span class="chip chip-warn">'
-                    f'<span class="dot"></span>{len(alerts_df)} alerts across '
-                    f'{ncat} categories</span></div>', unsafe_allow_html=True)
+                    f'<span class="dot"></span>{n_impact} alert(s) need '
+                    f'attention</span></div>', unsafe_allow_html=True)
+    elif len(alerts_df):
+        st.markdown(f'<div style="margin-top:12px"><span class="chip chip-ok">'
+                    f'<span class="dot"></span>No alerts need attention '
+                    f'({len(alerts_df)} audit-only entries below)</span></div>',
+                    unsafe_allow_html=True)
     else:
         st.markdown('<div style="margin-top:12px"><span class="chip chip-ok">'
                     '<span class="dot"></span>No alerts</span></div>',
                     unsafe_allow_html=True)
 
 if len(alerts_df):
-    with st.expander(f"Alert detail ({len(alerts_df)})", expanded=False):
-        types = sorted(alerts_df["Type"].unique())
-        pick = st.multiselect("Filter by type", types, default=types,
-                              key="alert_filter")
-        shown = alerts_df[alerts_df["Type"].isin(pick)] if pick else alerts_df
-        st.dataframe(shown, use_container_width=True, hide_index=True, height=300)
+    impact_df = alerts_df[alerts_df["Type"].isin(IMPACT_ALERTS)]
+    audit_df = alerts_df[~alerts_df["Type"].isin(IMPACT_ALERTS)]
+
+    with st.expander(f"Needs attention ({len(impact_df)})",
+                     expanded=len(impact_df) > 0):
+        if len(impact_df):
+            types = sorted(impact_df["Type"].unique())
+            pick = st.multiselect("Filter by type", types, default=types,
+                                  key="alert_filter_impact")
+            shown = impact_df[impact_df["Type"].isin(pick)] if pick else impact_df
+            st.caption(f"Showing {len(shown)} of {len(impact_df)}")
+            st.dataframe(shown, use_container_width=True, hide_index=True,
+                        height=300)
+        else:
+            st.caption("None.")
+
+    with st.expander(f"Audit trail — no return impact ({len(audit_df)})",
+                     expanded=False):
+        st.caption("The engine checked these and confirmed no action was needed "
+                   "— e.g. a corporate action was found but the symbol was not "
+                   "held on the ex-date, or a demerger factor was required but "
+                   "the position was never held across the ex-date. Kept for "
+                   "verification; none of these change NAV or return.")
+        if len(audit_df):
+            atypes = sorted(audit_df["Type"].unique())
+            apick = st.multiselect("Filter by type", atypes, default=atypes,
+                                   key="alert_filter_audit")
+            ashown = audit_df[audit_df["Type"].isin(apick)] if apick else audit_df
+            st.caption(f"Showing {len(ashown)} of {len(audit_df)}")
+            st.dataframe(ashown, use_container_width=True, hide_index=True,
+                        height=300)
+        else:
+            st.caption("None.")
 
 # -- chart --------------------------------------------------------------------
 
@@ -871,19 +947,33 @@ st.markdown('<div class="sec">Detail</div>', unsafe_allow_html=True)
 
 with tab_attr:
     if len(attrib_df):
+        _cols = ["Symbol", "AbsReturnPct", "ContributionPP", "Total",
+                "Realised", "Unrealised", "Dividends", "Invested", "StillHeld"]
+        _view = attrib_df[[c for c in _cols if c in attrib_df.columns]]
+        _cfg = {
+            "AbsReturnPct": st.column_config.NumberColumn(
+                "Position return %", format="%.2f",
+                help="This symbol's own P&L as a % of capital deployed to it."),
+            "ContributionPP": st.column_config.NumberColumn(
+                "Contribution pp", format="%.2f",
+                help="This symbol's rupee P&L as a % of the whole portfolio's "
+                     "starting capital."),
+        }
         ca_, cb_ = st.columns(2, gap="large")
         with ca_:
             st.markdown("**Key contributors**")
-            st.dataframe(attrib_df.head(10), use_container_width=True,
-                         hide_index=True, height=380)
+            st.dataframe(_view.head(10), use_container_width=True,
+                         hide_index=True, height=380, column_config=_cfg)
         with cb_:
             st.markdown("**Key detractors**")
-            st.dataframe(attrib_df.tail(10).iloc[::-1], use_container_width=True,
-                         hide_index=True, height=380)
+            st.dataframe(_view.tail(10).iloc[::-1], use_container_width=True,
+                         hide_index=True, height=380, column_config=_cfg)
         st.caption("Realised P&L uses FIFO lots, so a symbol traded in and out "
                    "repeatedly is not flattered by averaging across separate holding "
-                   "periods. ContributionPP is the rupee total as a percentage of "
-                   "starting capital; the column sums to total P&L including "
+                   "periods. Position return % is this symbol's own gain/loss on "
+                   "capital deployed to it; ContributionPP is the rupee total as a "
+                   "percentage of starting capital; the column sums to total P&L "
+                   "including "
                    "dividends.")
     else:
         st.info("No closed or open positions to attribute.")
