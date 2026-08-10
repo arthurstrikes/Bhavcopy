@@ -1132,11 +1132,20 @@ def attribution(nav_rows, trades, dividends_paid=None):
             cost = sum(q * p for q, p in lots[sym])
             unreal = h["value"] - cost
         total = realised[sym] + unreal + div_by_sym[sym]
+        invested = bought[sym]
         rows.append(dict(Symbol=sym, Realised=round(realised[sym], 2),
                          Unrealised=round(unreal, 2),
                          Dividends=round(div_by_sym[sym], 2),
                          Total=round(total, 2),
-                         Invested=round(bought[sym], 2),
+                         Invested=round(invested, 2),
+                         # this symbol's own return on capital deployed to it -
+                         # distinct from ContributionPP, which is this symbol's
+                         # rupee P&L as a % of the WHOLE portfolio's starting
+                         # capital. A small position that doubled has a large
+                         # AbsReturnPct but a small ContributionPP; both are
+                         # useful and answer different questions.
+                         AbsReturnPct=(round(total / invested * 100, 2)
+                                      if invested else None),
                          StillHeld="Yes" if h else "No"))
     df = pd.DataFrame(rows)
     if len(df):

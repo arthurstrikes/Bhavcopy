@@ -83,6 +83,8 @@ INDEX_ALIASES = {
     "NIFTY MIDSML 400": "Nifty MidSmallcap 400",
     "NIFTYMIDSMALL400": "Nifty MidSmallcap 400",
     "NIFTY MID SMALL 400": "Nifty MidSmallcap 400",
+    "NIFTYMIDSMALLCAP400": "Nifty MidSmallcap 400",
+    "NIFTY MIDSMALLCAP 400": "Nifty MidSmallcap 400",
     "NIFTYLARGEMID250": "Nifty LargeMidcap 250",
     "NIFTYLARGEMIDCAP250": "Nifty LargeMidcap 250",
     "NIFTY LARGEMIDCAP 250": "Nifty LargeMidcap 250",
@@ -135,6 +137,9 @@ INDEX_ALIASES = {
     "NIFTY200MOM30": "Nifty200 Momentum 30",
     "NIFTY200MOMENTUM30": "Nifty200 Momentum 30",
     "NIFTY200 MOMENTUM 30": "Nifty200 Momentum 30",
+    "NIFTYTOTALMARKET": "Nifty Total Market",
+    "NIFTY TOTAL MARKET": "Nifty Total Market",
+    "NIFTYTOTAL": "Nifty Total Market",
 }
 
 # BSE indices (SENSEX, BSE100/200/500, BSE sectorals) are NOT published by NSE —
