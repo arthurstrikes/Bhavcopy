@@ -51,6 +51,7 @@ ALERT_FORCED = "FORCED REBALANCE (no log row)"
 ALERT_ZERO_PX = "LOG PRICE ZERO"
 ALERT_NO_PX = "NO PRICE - TRADE SKIPPED"
 ALERT_NEG_CASH = "NEGATIVE CASH"
+ALERT_UNDERFILL = "BUY UNDERFILLED - INSUFFICIENT CASH"
 ALERT_NO_CLOSE = "NO EOD CLOSE"
 ALERT_STALE_PX = "PRE-START ADVICE - REPRICED"
 ALERT_DIVIDEND = "DIVIDEND CREDITED"
@@ -394,9 +395,12 @@ def run_nav(log, closes, capital, start, to_date,
                 if want != held:
                     plan.append((symbol, want - held, price, target, actual, source))
 
-            # sells first, then buys
+            # Sells first (locked rule) - unconditional, they only raise cash.
+            sells = [p for p in plan if p[1] < 0]
+            buys = [p for p in plan if p[1] > 0]
+
             for symbol, delta, price, target, actual, source in sorted(
-                    plan, key=lambda p: (p[1] >= 0, p[0])):
+                    sells, key=lambda p: p[0]):
                 cash -= delta * price
                 portfolio[symbol] = portfolio.get(symbol, 0) + delta
                 if portfolio[symbol] <= 0:
@@ -405,14 +409,54 @@ def run_nav(log, closes, capital, start, to_date,
                 else:
                     last_px[symbol] = price
                 trades.append(dict(
-                    Date=day, Symbol=symbol, Side="BUY" if delta > 0 else "SELL",
+                    Date=day, Symbol=symbol, Side="SELL",
                     Qty=abs(delta), Price=round(price, 2),
                     Value=round(abs(delta) * price, 2),
                     ModelWt=round(target, 2), ClientWtBefore=round(actual, 2),
                     DeviationPP=round(actual - target, 2), PriceSource=source,
                 ))
 
-            if cash < 0:
+            # Buys are capped at available cash. A real client cannot buy without
+            # funding it - the tolerance band leaves excess trapped in untraded
+            # holdings, so the model's 100% never guarantees the cash is actually
+            # there. Every planned buy is scaled by the same factor and re-floored
+            # individually; no symbol is favoured. Underfunded positions stay
+            # underweight until the next event date releases cash through a trim
+            # or exit.
+            required = sum(delta * price for _, delta, price, *_ in buys)
+            if required <= 0:
+                scale = 1.0
+            elif cash <= 0:
+                scale = 0.0
+            else:
+                scale = min(1.0, cash / required)
+
+            for symbol, delta, price, target, actual, source in sorted(
+                    buys, key=lambda p: p[0]):
+                qty = delta if scale >= 1.0 else math.floor(delta * scale)
+                if qty > 0:
+                    cash -= qty * price
+                    portfolio[symbol] = portfolio.get(symbol, 0) + qty
+                    last_px[symbol] = price
+                    trades.append(dict(
+                        Date=day, Symbol=symbol, Side="BUY",
+                        Qty=qty, Price=round(price, 2),
+                        Value=round(qty * price, 2),
+                        ModelWt=round(target, 2), ClientWtBefore=round(actual, 2),
+                        DeviationPP=round(actual - target, 2), PriceSource=source,
+                    ))
+                if qty < delta:
+                    held_after = portfolio.get(symbol, 0)
+                    achieved = (held_after * price / base_nav * 100.0) if base_nav else 0.0
+                    shortfall = (delta - qty) * price
+                    alerts.append(dict(
+                        Date=day, Symbol=symbol, Type=ALERT_UNDERFILL,
+                        Detail=(f"target {target:.2f}% but only {achieved:.2f}% funded - "
+                                f"cash short by {shortfall:,.2f}; position stays "
+                                f"underweight until the next event date"),
+                    ))
+
+            if cash < -0.01:
                 alerts.append(dict(
                     Date=day, Symbol="-", Type=ALERT_NEG_CASH,
                     Detail=f"cash {cash:,.2f} after rebalance - capital insufficient "
@@ -570,7 +614,8 @@ def holdings_matrix(nav_rows, measure="weight"):
 _PERIODS = (("MTD", None), ("1M", 1), ("3M", 3), ("6M", 6), ("1Y", 12))
 
 
-def period_returns(nav_rows, capital, bench=None, bench_name="Benchmark", key="NAV"):
+def period_returns(nav_rows, capital, bench=None, bench_name="Benchmark", key="NAV",
+                   div_events=None):
     """
     Point-to-point price returns for MTD / 1M / 3M / 6M / 1Y / Since launch.
 
@@ -582,12 +627,27 @@ def period_returns(nav_rows, capital, bench=None, bench_name="Benchmark", key="N
 
     Price return only on both legs - the NSE bhavcopy is a price series and the
     portfolio excludes dividends, so the two are consistent.
+
+    key="NAV_TR" reports the dividend-inclusive basis as price return PLUS the
+    dividend cash actually received inside the window, divided by the base
+    session's NAV - not NAV_TR(end)/NAV_TR(base). Dividend cash is never
+    reinvested, so it is a constant added to both the base and end NAV_TR; for a
+    window with no dividend events that constant dilutes the ratio, so the
+    dividend-inclusive figure can print BELOW the price-only figure - reads as a
+    bug. Adding the period's own income on top of the price return guarantees
+    incl. dividends is never lower than excl., and "Since launch" is unchanged
+    (base is capital, so the full income is always in that window).
     """
     dates = [r["Date"] for r in nav_rows]
-    navs = {r["Date"]: r[key] for r in nav_rows}
+    navs = {r["Date"]: r["NAV"] for r in nav_rows}
     inception, as_of = dates[0], dates[-1]
     bench = bench or {}
     bench_dates = sorted(bench)
+    div_events = div_events or []
+
+    def income_in_window(base, end):
+        """Dividend cash received after `base` through `end` (inclusive)."""
+        return sum(d["Amount"] for d in div_events if base < d["Date"] <= end)
 
     def session_at_or_before(d):
         c = [x for x in dates if x <= d]
@@ -617,6 +677,8 @@ def period_returns(nav_rows, capital, bench=None, bench_name="Benchmark", key="N
 
         base_nav = float(capital) if si else navs[base]
         port = (navs[as_of] / base_nav - 1) * 100 if base_nav else None
+        if key == "NAV_TR" and port is not None and base_nav:
+            port += income_in_window(base, as_of) / base_nav * 100.0
 
         b_start = bench_at_or_before(base)
         bmk = ((b_end / b_start - 1) * 100
@@ -814,6 +876,14 @@ def apply_corporate_actions(closes, log, actions, mode="pre_ex_down",
             continue
         ov = overrides.get((sym, ex))
         if not is_adjustable(purpose) and ov is None:
+            p_up = str(purpose).upper()
+            if "DIVIDEND" in p_up or "INTEREST" in p_up:
+                # Price-return basis excludes dividends by design - this restates
+                # the run's standing policy on every dividend for every held
+                # stock (the single largest contributor to alert volume) and the
+                # disclosure footer already states it. Not a judgement call, so
+                # no alert.
+                continue
             alerts.append(dict(Date=ex, Symbol=sym, Type="CORPORATE ACTION - NOT ADJUSTED",
                                Detail=f"{purpose} - price-return basis, no adjustment applied"))
             continue
@@ -917,11 +987,16 @@ def parse_dps(purpose):
 
 def build_dividends(actions, held_symbols):
     """
-    {ex_date: [{symbol, dps, purpose}]} plus alerts.
+    {ex_date: [{symbol, dps, purpose}]}, alerts, and the count of duplicate NSE
+    series listings collapsed into one record.
 
     De-duplicated on (symbol, dps) within a 7-day window. NSE lists the same
     dividend under several series with slightly different ex-dates - BEL appears
     on both 05-Mar and 06-Mar at RS 1.95, which would otherwise be counted twice.
+    This is deterministic data cleaning, not a judgement call - the duplicate is
+    still discarded before crediting (one record kept, cash credited once), it
+    just no longer produces an alert row. The count is returned so the caller can
+    show it as a passive caption instead.
     """
     parsed, alerts = [], []
     for a in actions:
@@ -937,15 +1012,12 @@ def build_dividends(actions, held_symbols):
         parsed.append(dict(symbol=sym, ex=a["ExDate"], dps=dps, purpose=a["Purpose"]))
 
     parsed.sort(key=lambda x: (x["symbol"], x["dps"], x["ex"]))
-    kept, last = [], {}
+    kept, last, suppressed = [], {}, 0
     for p in parsed:
         key = (p["symbol"], round(p["dps"], 4))
         prev = last.get(key)
         if prev and (p["ex"] - prev).days <= DIV_DEDUP_WINDOW_DAYS:
-            alerts.append(dict(Date=p["ex"], Symbol=p["symbol"],
-                               Type="DUPLICATE DIVIDEND SUPPRESSED",
-                               Detail=(f"{p['purpose']} on {p['ex']} repeats the same "
-                                       f"amount already recorded on {prev} - counted once")))
+            suppressed += 1
             continue
         last[key] = p["ex"]
         kept.append(p)
@@ -954,7 +1026,7 @@ def build_dividends(actions, held_symbols):
     for p in kept:
         by_date[p["ex"]].append(dict(symbol=p["symbol"], dps=p["dps"],
                                      purpose=p["purpose"]))
-    return dict(by_date), alerts
+    return dict(by_date), alerts, suppressed
 
 
 # -- corporate action overrides file ------------------------------------------
