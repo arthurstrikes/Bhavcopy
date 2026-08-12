@@ -171,14 +171,15 @@ NSE_NATIVE_BENCHMARKS = [
 ]
 
 # BSE indices are not published by NSE and stay on yfinance permanently (see
-# nse_bhavcopy.py). ^BSE500 is UNVERIFIED from this build environment - Yahoo
+# nse_bhavcopy.py). BSE 500 uses Yahoo's BSE-500.BO symbol - the ^ prefix
 # Finance access was blocked in the sandbox used to build this, so the ticker
 # could not be tested end-to-end. Confirm it resolves on first live use; if it
 # returns no data, check the correct BSE 500 ticker on Yahoo Finance directly
 # and update BENCH_MAP.
 BENCH_MAP = {
     "Sensex": "^BSESN",
-    "BSE 500": "^BSE500",  # UNVERIFIED - confirm on first live use
+    "BSE 500": "BSE-500.BO",  # verified against Yahoo's own quote page;
+                              # BSE indices use BSE-{n}.BO, not a ^ prefix
 }
 
 
@@ -549,7 +550,7 @@ with st.sidebar:
 
     run_btn = st.button("Calculate NAV", type="primary", use_container_width=True,
                         disabled=log_source is None)
-    st.caption("IMP NAV Calculator v3.1")
+    st.caption("IMP NAV Calculator v3.2")
 
 # -- landing ------------------------------------------------------------------
 
@@ -837,7 +838,7 @@ if len(alerts_df):
     audit_df = alerts_df[~alerts_df["Type"].isin(IMPACT_ALERTS)]
 
     with st.expander(f"Needs attention ({len(impact_df)})",
-                     expanded=len(impact_df) > 0):
+                     expanded=False):
         if len(impact_df):
             types = sorted(impact_df["Type"].unique())
             pick = st.multiselect("Filter by type", types, default=types,
@@ -1003,24 +1004,245 @@ with col_s:
     st.dataframe(pd.DataFrame(list(summary.items()), columns=["Metric", "Value"]),
                  use_container_width=True, hide_index=True, height=490)
 
+# -- 2x MTF comparison section ----------------------------------------------------
+
+if st.session_state.get("mtf_results"):
+    st.markdown('<div class="sec">Cash model vs 2x MTF</div>',
+                unsafe_allow_html=True)
+    _rows, _audit = st.session_state["mtf_results"]
+    _c = mtf.apply_costs(_rows, interest_pa=mtf_rate / 100.0,
+                         pledge=mtf_pledge, brokerage_pct=brokerage_pct,
+                         statutory_pct=statutory_pct)
+
+    # Cash model, costed on the SAME rates so the two columns are
+    # comparable. The headline above this tab is still gross - that is a
+    # known open item and is stated in the note below.
+    _cash_turnover = sum(t["Value"] for t in trades)
+    _cash_cost = _cash_turnover * (brokerage_pct + statutory_pct) / 100.0
+    _cash_gross_end = nav_rows[-1]["NAV"]
+    _cash_end = _cash_gross_end - _cash_cost
+    _cash_ret = _cash_end / capital - 1
+    _mtf_end = _c[-1]["NetAfterCosts"]
+    _mtf_ret = _mtf_end / capital - 1
+
+    st.markdown(
+        '<div class="warn">This comparison does <strong>not</strong> simulate a '
+        'margin call or forced selling. In reality the broker would have '
+        'stopped new borrowing, and likely forced a sale, well before the '
+        'worst points shown here - so real losses in a bad stretch could '
+        'have been locked in earlier and at worse prices. The interest rate '
+        'and pledge charge are placeholders until the broker\'s actual fee '
+        'schedule is confirmed.</div>', unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Cash model - no borrowing", f"{_cash_ret * 100:.2f}%",
+              help="Return on the client's own money after brokerage and "
+                   "statutory charges.")
+    c2.metric(f"2x MTF - at {mtf_rate:.2f}% p.a.", f"{_mtf_ret * 100:.2f}%",
+              delta=f"{(_mtf_ret - _cash_ret) * 100:+.2f} pp",
+              help="Return on the same own money after brokerage, statutory "
+                   "charges, MTF interest and pledge fees.")
+    c3.metric("Extra rupees earned", f"{_mtf_end - _cash_end:,.0f}",
+              help="Difference in the final value of the client's own money.")
+
+    _cash_dd, _, _, _ = mtf.max_drawdown([r["NAV"] for r in nav_rows])
+    _mtf_dd, _s_i, _e_i, _pk = mtf.max_drawdown([r["NetWorth"] for r in _rows])
+    _ratios = [r["StockPerRupee"] for r in _rows if r["StockPerRupee"]]
+    _avg_lev = sum(_ratios) / len(_ratios) if _ratios else 0.0
+
+    st.markdown(
+        f'<div class="note">Borrowing turned <strong>{_cash_ret * 100:.2f}%</strong> '
+        f'into <strong>{_mtf_ret * 100:.2f}%</strong> on the same '
+        f'Rs {capital:,.0f}, and turned a worst fall of '
+        f'<strong>{_cash_dd * 100:.2f}%</strong> into '
+        f'<strong>{_mtf_dd * 100:.2f}%</strong>. The client paid '
+        f'Rs {_c[-1]["AllCosts"] - _cash_cost:,.0f} more in costs to get it.'
+        f'</div>', unsafe_allow_html=True)
+
+    # -- cost ladder ---------------------------------------------------
+    st.markdown('<div class="sec">Where the money went</div>',
+                unsafe_allow_html=True)
+    _ladder = pd.DataFrame([
+        ("Client's own money put in", capital, 0.0, capital, 0.0),
+        ("Value before any costs", _cash_gross_end,
+         (_cash_gross_end / capital - 1) * 100,
+         _rows[-1]["NetWorth"], (_rows[-1]["NetWorth"] / capital - 1) * 100),
+        ("Less: brokerage", -_cash_turnover * brokerage_pct / 100.0,
+         -_cash_turnover * brokerage_pct / 100.0 / capital * 100,
+         -_c[-1]["Brokerage"], -_c[-1]["Brokerage"] / capital * 100),
+        ("Less: statutory charges", -_cash_turnover * statutory_pct / 100.0,
+         -_cash_turnover * statutory_pct / 100.0 / capital * 100,
+         -_c[-1]["Statutory"], -_c[-1]["Statutory"] / capital * 100),
+        ("Less: MTF interest", 0.0, 0.0,
+         -_c[-1]["Interest"], -_c[-1]["Interest"] / capital * 100),
+        ("Less: pledge / unpledge", 0.0, 0.0,
+         -_c[-1]["Pledge"], -_c[-1]["Pledge"] / capital * 100),
+        ("Final value of client's money", _cash_end,
+         (_cash_end / capital - 1) * 100, _mtf_end, _mtf_ret * 100),
+    ], columns=["Step", "Cash model Rs", "Cash model %",
+                "2x MTF Rs", "2x MTF %"])
+    st.dataframe(_ladder, use_container_width=True, hide_index=True,
+                 column_config={
+                     "Cash model Rs": st.column_config.NumberColumn(format="%.0f"),
+                     "2x MTF Rs": st.column_config.NumberColumn(format="%.0f"),
+                     "Cash model %": st.column_config.NumberColumn(format="%.2f"),
+                     "2x MTF %": st.column_config.NumberColumn(format="%.2f")})
+    st.caption(
+        f"Every % is measured against the client's own Rs {capital:,.0f}, so the "
+        f"two columns compare directly. The MTF book trades about double the "
+        f"rupee value (Rs {_audit['turnover']:,.0f} vs Rs {_cash_turnover:,.0f}), "
+        f"so its brokerage and statutory charges are about double. That is real, "
+        f"not double-counting. The return shown at the top of this page is BEFORE "
+        f"costs; the figures in this section are the same strategy AFTER them.")
+
+    # -- chart ---------------------------------------------------------
+    # Both series must be net of the same costs. Plotting a gross cash line
+    # against a net MTF line overstated the cash model by the full cost drag.
+    _cash_cum, _cash_net_series = 0.0, []
+    _turn_by_day = {}
+    for _t in trades:
+        _turn_by_day[_t["Date"]] = _turn_by_day.get(_t["Date"], 0.0) + _t["Value"]
+    for _r in nav_rows:
+        _cash_cum += _turn_by_day.get(_r["Date"], 0.0) * (
+            brokerage_pct + statutory_pct) / 100.0
+        _cash_net_series.append((_r["NAV"] - _cash_cum) / capital * 100)
+    _fig = go.Figure()
+    _fig.add_trace(go.Scatter(
+        x=[r["Date"] for r in nav_rows], y=_cash_net_series,
+        name="Cash model, after costs", mode="lines", line=dict(width=2)))
+    _fig.add_trace(go.Scatter(
+        x=[r["Date"] for r in _c], y=[r["NetAfterCosts"] / capital * 100 for r in _c],
+        name="2x MTF, after costs", mode="lines", line=dict(width=2)))
+    _fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10),
+                       yaxis_title="Client's money, indexed to 100",
+                       legend=dict(orientation="h", y=1.12))
+    st.plotly_chart(_fig, use_container_width=True)
+
+    # -- how much stock per rupee --------------------------------------
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Stock held per Rs 1 of client money (avg)", f"{_avg_lev:.2f}x")
+    c2.metric("Lowest", f"{min(_ratios):.2f}x" if _ratios else "n/a")
+    c3.metric("Highest", f"{max(_ratios):.2f}x" if _ratios else "n/a")
+    st.caption(
+        "'2x MTF' describes how each stock purchase is funded - half own "
+        "money, half borrowed. It is not the whole-portfolio exposure. Any "
+        "cash or liquid-ETF weight is never borrowed against, so a portfolio "
+        "carrying idle cash will show well under 2.00x here. That is expected, "
+        "not an error.")
+
+    # -- sensitivity ---------------------------------------------------
+    with st.expander("What if the rates were different?"):
+        _be = mtf.breakeven_interest(_rows, capital, _cash_ret,
+                                     pledge=mtf_pledge,
+                                     brokerage_pct=brokerage_pct,
+                                     statutory_pct=statutory_pct)
+        if _be is None:
+            st.markdown(
+                '<div class="warn">At these brokerage and statutory rates, '
+                'borrowing does not beat the cash model at any interest rate '
+                'over this period.</div>', unsafe_allow_html=True)
+        else:
+            st.metric("Break-even MTF interest rate", f"{_be * 100:.2f}% p.a.",
+                      help="Above this rate the client would have been better "
+                           "off without MTF, on this strategy over this period.")
+        _int_tbl = pd.DataFrame([
+            dict(Rate_pct_pa=rt * 100,
+                 MTF_return_pct=mtf.roe_after_costs(
+                     _rows, capital, interest_pa=rt, pledge=mtf_pledge,
+                     brokerage_pct=brokerage_pct,
+                     statutory_pct=statutory_pct) * 100,
+                 Cash_model_pct=_cash_ret * 100,
+                 Advantage_pp=(mtf.roe_after_costs(
+                     _rows, capital, interest_pa=rt, pledge=mtf_pledge,
+                     brokerage_pct=brokerage_pct,
+                     statutory_pct=statutory_pct) - _cash_ret) * 100)
+            for rt in (0.10, 0.12, 0.14, 0.15, 0.16, 0.18, 0.20)])
+        st.markdown("**If the MTF interest rate changed**")
+        st.dataframe(_int_tbl, use_container_width=True, hide_index=True)
+
+        _brok_tbl = []
+        for bk in (0.02, 0.05, 0.10, 0.15, 0.20, 0.30):
+            _cm = (_cash_gross_end - _cash_turnover
+                   * (bk + statutory_pct) / 100.0) / capital - 1
+            _mm = mtf.roe_after_costs(_rows, capital,
+                                      interest_pa=mtf_rate / 100.0,
+                                      pledge=mtf_pledge, brokerage_pct=bk,
+                                      statutory_pct=statutory_pct)
+            _brok_tbl.append(dict(Brokerage_pct_per_side=bk,
+                                  Cash_model_pct=_cm * 100,
+                                  MTF_return_pct=_mm * 100,
+                                  Advantage_pp=(_mm - _cm) * 100))
+        st.markdown("**If the brokerage rate changed**")
+        st.dataframe(pd.DataFrame(_brok_tbl), use_container_width=True,
+                     hide_index=True)
+        st.caption(
+            "Both models pay brokerage on every trade, and the MTF book trades "
+            "about double the value, so brokerage is usually a bigger lever on "
+            "the final answer than the MTF interest rate. Worth checking which "
+            "rate is actually negotiable.")
+
+    # -- monthly -------------------------------------------------------
+    with st.expander("Month by month"):
+        _md = pd.DataFrame([
+            dict(Date=r["Date"], Cash=n["NAV"], Mtf=r["NetAfterCosts"])
+            for r, n in zip(_c, nav_rows)])
+        _md["M"] = pd.to_datetime(_md["Date"]).dt.to_period("M").astype(str)
+        _mrows, _pc, _pm = [], capital, capital
+        for _m, _g in _md.groupby("M", sort=True):
+            _ec, _em = _g["Cash"].iloc[-1], _g["Mtf"].iloc[-1]
+            _mrows.append(dict(Month=_m,
+                               Cash_model_pct=(_ec / _pc - 1) * 100,
+                               MTF_pct=(_em / _pm - 1) * 100,
+                               Difference_pp=((_em / _pm) - (_ec / _pc)) * 100))
+            _pc, _pm = _ec, _em
+        _mdf = pd.DataFrame(_mrows)
+        st.dataframe(_mdf, use_container_width=True, hide_index=True)
+        _up = _mdf[_mdf.Cash_model_pct > 0]
+        _dn = _mdf[_mdf.Cash_model_pct <= 0]
+        st.caption(
+            f"In the {len(_up)} positive months MTF added "
+            f"{_up.Difference_pp.mean():+.2f}pp on average; in the {len(_dn)} "
+            f"flat or negative months it cost {_dn.Difference_pp.mean():+.2f}pp. "
+            f"Interest is charged every calendar day regardless of whether the "
+            f"month worked, so a flat month is a small loss under MTF.")
+
+    # -- daily detail --------------------------------------------------
+    with st.expander("Daily detail"):
+        _dd = pd.DataFrame([dict(
+            Date=r["Date"],
+            CashModelNAV=n["NAV"],
+            StockValue=r["GrossAssets"],
+            CashBalance=r["Cash"],
+            BorrowedAmount=r["TotalLeverage"],
+            ClientMoneyValue=r["NetWorth"],
+            StockPerRupee=r["StockPerRupee"],
+            Positions=r["Positions"],
+            CostsToDate=r["AllCosts"],
+            ValueAfterCosts=r["NetAfterCosts"],
+        ) for r, n in zip(_c, nav_rows)])
+        st.dataframe(_dd, use_container_width=True, hide_index=True, height=420)
+        st.download_button(
+            "Download MTF daily detail (CSV)",
+            _dd.to_csv(index=False).encode(),
+            file_name=f"{pname.replace(' ', '_')}_MTF_daily.csv",
+            mime="text/csv")
+
 # -- detail tabs --------------------------------------------------------------
 
 st.markdown('<div class="sec">Detail</div>', unsafe_allow_html=True)
-_mtf_state = st.session_state.get("mtf_results")
-_names = ["Contributors", "Risk & costs", "Daily NAV", "Holdings on a date",
+# A keyed radio rather than st.tabs. st.tabs keeps its selection in the
+# browser only, so ANY widget rerun (changing the Holdings date, a filter, a
+# download) snapped the user back to the first tab. Radio state lives in
+# session_state and survives the rerun.
+_VIEWS = ["Contributors", "Risk & costs", "Daily NAV", "Holdings on a date",
           "Holdings matrix", "Trades", "Dividends", "Reconciliation"]
-if _mtf_state:
-    _names.insert(2, "2x MTF comparison")
-_tabs = st.tabs(_names)
-if _mtf_state:
-    (tab_attr, tab_risk, tab_mtf, tab_nav, tab_book, tab_matrix,
-     tab_trades, tab_div, tab_recon) = _tabs
-else:
-    tab_mtf = None
-    (tab_attr, tab_risk, tab_nav, tab_book, tab_matrix,
-     tab_trades, tab_div, tab_recon) = _tabs
+if st.session_state.get("detail_view") not in _VIEWS:
+    st.session_state["detail_view"] = _VIEWS[0]
+st.radio("Detail view", _VIEWS, key="detail_view", horizontal=True,
+         label_visibility="collapsed")
+_v = st.session_state["detail_view"]
 
-with tab_attr:
+if _v == "Contributors":
     if len(attrib_df):
         _cols = ["Symbol", "AbsReturnPct", "ContributionPP", "Total",
                 "Realised", "Unrealised", "Dividends", "Invested", "StillHeld"]
@@ -1053,7 +1275,7 @@ with tab_attr:
     else:
         st.info("No closed or open positions to attribute.")
 
-with tab_risk:
+if _v == "Risk & costs":
     r1, r2, r3 = st.columns(3, gap="large")
     with r1:
         st.markdown("**Risk**")
@@ -1072,7 +1294,7 @@ with tab_risk:
         st.caption("Cash earns nothing in this model, so a high average cash weight "
                    "is a real drag relative to a fully invested index.")
 
-with tab_nav:
+if _v == "Daily NAV":
     flt = st.selectbox("Rows", ["All", "Event days only", "MTM days only"],
                        key="navflt")
     dsel = nav_df.copy()
@@ -1096,7 +1318,7 @@ with tab_nav:
     st.caption("NAV excludes dividends; NAV_TR includes them. DividendCash is the "
                "running total received.")
 
-with tab_book:
+if _v == "Holdings on a date":
     sessions = [r["Date"] for r in nav_rows]
     pick = st.selectbox("Session", sessions[::-1], index=0, key="book_date",
                         format_func=lambda d: d.strftime("%d %b %Y (%a)"))
@@ -1116,7 +1338,7 @@ with tab_book:
         else:
             st.info("Fully in cash on this session.")
 
-with tab_matrix:
+if _v == "Holdings matrix":
     measure = st.radio("Measure", ["Weight %", "Quantity"], horizontal=True, key="mx")
     mx = wt_matrix if measure == "Weight %" else qty_matrix
     st.dataframe(mx.iloc[::-1].reset_index(drop=True), use_container_width=True,
@@ -1126,7 +1348,7 @@ with tab_matrix:
                if measure == "Weight %" else
                "Share counts held at each session close. Blank = not held.")
 
-with tab_trades:
+if _v == "Trades":
     if len(trades_df):
         st.dataframe(trades_df.iloc[::-1].reset_index(drop=True),
                      use_container_width=True, hide_index=True, height=420)
@@ -1136,7 +1358,7 @@ with tab_trades:
     else:
         st.info("No trades generated.")
 
-with tab_div:
+if _v == "Dividends":
     if len(div_df):
         st.dataframe(div_df.iloc[::-1].reset_index(drop=True),
                      use_container_width=True, hide_index=True, height=380)
@@ -1151,249 +1373,13 @@ with tab_div:
     else:
         st.info("Dividends are switched off in the sidebar.")
 
-with tab_recon:
+if _v == "Reconciliation":
     st.dataframe(recon_df.iloc[::-1].reset_index(drop=True),
                  use_container_width=True, hide_index=True, height=420)
     st.caption("Model weight vs achieved weight per holding per day. "
                "DriftPP inside the tolerance is expected.")
 
 
-# -- 2x MTF comparison tab ----------------------------------------------------
-
-if tab_mtf is not None:
-    with tab_mtf:
-        _rows, _audit = st.session_state["mtf_results"]
-        _c = mtf.apply_costs(_rows, interest_pa=mtf_rate / 100.0,
-                             pledge=mtf_pledge, brokerage_pct=brokerage_pct,
-                             statutory_pct=statutory_pct)
-
-        # Cash model, costed on the SAME rates so the two columns are
-        # comparable. The headline above this tab is still gross - that is a
-        # known open item and is stated in the note below.
-        _cash_turnover = sum(t["Value"] for t in trades)
-        _cash_cost = _cash_turnover * (brokerage_pct + statutory_pct) / 100.0
-        _cash_gross_end = nav_rows[-1]["NAV"]
-        _cash_end = _cash_gross_end - _cash_cost
-        _cash_ret = _cash_end / capital - 1
-        _mtf_end = _c[-1]["NetAfterCosts"]
-        _mtf_ret = _mtf_end / capital - 1
-
-        st.markdown(
-            '<div class="warn">This comparison does <strong>not</strong> simulate a '
-            'margin call or forced selling. In reality the broker would have '
-            'stopped new borrowing, and likely forced a sale, well before the '
-            'worst points shown here - so real losses in a bad stretch could '
-            'have been locked in earlier and at worse prices. The interest rate '
-            'and pledge charge are placeholders until the broker\'s actual fee '
-            'schedule is confirmed.</div>', unsafe_allow_html=True)
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Cash model - no borrowing", f"{_cash_ret * 100:.2f}%",
-                  help="Return on the client's own money after brokerage and "
-                       "statutory charges.")
-        c2.metric(f"2x MTF - at {mtf_rate:.2f}% p.a.", f"{_mtf_ret * 100:.2f}%",
-                  delta=f"{(_mtf_ret - _cash_ret) * 100:+.2f} pp",
-                  help="Return on the same own money after brokerage, statutory "
-                       "charges, MTF interest and pledge fees.")
-        c3.metric("Extra rupees earned", f"{_mtf_end - _cash_end:,.0f}",
-                  help="Difference in the final value of the client's own money.")
-
-        _cash_dd, _, _, _ = mtf.max_drawdown([r["NAV"] for r in nav_rows])
-        _mtf_dd, _s_i, _e_i, _pk = mtf.max_drawdown([r["NetWorth"] for r in _rows])
-        _ratios = [r["StockPerRupee"] for r in _rows if r["StockPerRupee"]]
-        _avg_lev = sum(_ratios) / len(_ratios) if _ratios else 0.0
-
-        st.markdown(
-            f'<div class="note">Borrowing turned <strong>{_cash_ret * 100:.2f}%</strong> '
-            f'into <strong>{_mtf_ret * 100:.2f}%</strong> on the same '
-            f'Rs {capital:,.0f}, and turned a worst fall of '
-            f'<strong>{_cash_dd * 100:.2f}%</strong> into '
-            f'<strong>{_mtf_dd * 100:.2f}%</strong>. The client paid '
-            f'Rs {_c[-1]["AllCosts"] - _cash_cost:,.0f} more in costs to get it.'
-            f'</div>', unsafe_allow_html=True)
-
-        # -- cost ladder ---------------------------------------------------
-        st.markdown('<div class="sec">Where the money went</div>',
-                    unsafe_allow_html=True)
-        _ladder = pd.DataFrame([
-            ("Client's own money put in", capital, 0.0, capital, 0.0),
-            ("Value before any costs", _cash_gross_end,
-             (_cash_gross_end / capital - 1) * 100,
-             _rows[-1]["NetWorth"], (_rows[-1]["NetWorth"] / capital - 1) * 100),
-            ("Less: brokerage", -_cash_turnover * brokerage_pct / 100.0,
-             -_cash_turnover * brokerage_pct / 100.0 / capital * 100,
-             -_c[-1]["Brokerage"], -_c[-1]["Brokerage"] / capital * 100),
-            ("Less: statutory charges", -_cash_turnover * statutory_pct / 100.0,
-             -_cash_turnover * statutory_pct / 100.0 / capital * 100,
-             -_c[-1]["Statutory"], -_c[-1]["Statutory"] / capital * 100),
-            ("Less: MTF interest", 0.0, 0.0,
-             -_c[-1]["Interest"], -_c[-1]["Interest"] / capital * 100),
-            ("Less: pledge / unpledge", 0.0, 0.0,
-             -_c[-1]["Pledge"], -_c[-1]["Pledge"] / capital * 100),
-            ("Final value of client's money", _cash_end,
-             (_cash_end / capital - 1) * 100, _mtf_end, _mtf_ret * 100),
-        ], columns=["Step", "Cash model Rs", "Cash model %",
-                    "2x MTF Rs", "2x MTF %"])
-        st.dataframe(_ladder, use_container_width=True, hide_index=True,
-                     column_config={
-                         "Cash model Rs": st.column_config.NumberColumn(format="%.0f"),
-                         "2x MTF Rs": st.column_config.NumberColumn(format="%.0f"),
-                         "Cash model %": st.column_config.NumberColumn(format="%.2f"),
-                         "2x MTF %": st.column_config.NumberColumn(format="%.2f")})
-        st.caption(
-            f"Every % is measured against the client's own Rs {capital:,.0f}, so the "
-            f"two columns compare directly. The MTF book trades about double the "
-            f"rupee value (Rs {_audit['turnover']:,.0f} vs Rs {_cash_turnover:,.0f}), "
-            f"so its brokerage and statutory charges are about double. That is real, "
-            f"not double-counting. Note the headline figures above this tab are still "
-            f"gross of costs; only this tab nets them off.")
-
-        # -- chart ---------------------------------------------------------
-        _fig = go.Figure()
-        _fig.add_trace(go.Scatter(
-            x=[r["Date"] for r in nav_rows],
-            y=[r["NAV"] / capital * 100 for r in nav_rows],
-            name="Cash model", mode="lines", line=dict(width=2)))
-        _fig.add_trace(go.Scatter(
-            x=[r["Date"] for r in _c], y=[r["NetAfterCosts"] / capital * 100 for r in _c],
-            name="2x MTF, after costs", mode="lines", line=dict(width=2)))
-        _fig.update_layout(height=380, margin=dict(l=10, r=10, t=30, b=10),
-                           yaxis_title="Client's money, indexed to 100",
-                           legend=dict(orientation="h", y=1.12))
-        st.plotly_chart(_fig, use_container_width=True)
-
-        # -- how much stock per rupee --------------------------------------
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Stock held per Rs 1 of client money (avg)", f"{_avg_lev:.2f}x")
-        c2.metric("Lowest", f"{min(_ratios):.2f}x" if _ratios else "n/a")
-        c3.metric("Highest", f"{max(_ratios):.2f}x" if _ratios else "n/a")
-        st.caption(
-            "'2x MTF' describes how each stock purchase is funded - half own "
-            "money, half borrowed. It is not the whole-portfolio exposure. Any "
-            "cash or liquid-ETF weight is never borrowed against, so a portfolio "
-            "carrying idle cash will show well under 2.00x here. That is expected, "
-            "not an error.")
-
-        # -- sensitivity ---------------------------------------------------
-        with st.expander("What if the rates were different?"):
-            _be = mtf.breakeven_interest(_rows, capital, _cash_ret,
-                                         pledge=mtf_pledge,
-                                         brokerage_pct=brokerage_pct,
-                                         statutory_pct=statutory_pct)
-            if _be is None:
-                st.markdown(
-                    '<div class="warn">At these brokerage and statutory rates, '
-                    'borrowing does not beat the cash model at any interest rate '
-                    'over this period.</div>', unsafe_allow_html=True)
-            else:
-                st.metric("Break-even MTF interest rate", f"{_be * 100:.2f}% p.a.",
-                          help="Above this rate the client would have been better "
-                               "off without MTF, on this strategy over this period.")
-            _int_tbl = pd.DataFrame([
-                dict(Rate_pct_pa=rt * 100,
-                     MTF_return_pct=mtf.roe_after_costs(
-                         _rows, capital, interest_pa=rt, pledge=mtf_pledge,
-                         brokerage_pct=brokerage_pct,
-                         statutory_pct=statutory_pct) * 100,
-                     Cash_model_pct=_cash_ret * 100,
-                     Advantage_pp=(mtf.roe_after_costs(
-                         _rows, capital, interest_pa=rt, pledge=mtf_pledge,
-                         brokerage_pct=brokerage_pct,
-                         statutory_pct=statutory_pct) - _cash_ret) * 100)
-                for rt in (0.10, 0.12, 0.14, 0.15, 0.16, 0.18, 0.20)])
-            st.markdown("**If the MTF interest rate changed**")
-            st.dataframe(_int_tbl, use_container_width=True, hide_index=True)
-
-            _brok_tbl = []
-            for bk in (0.02, 0.05, 0.10, 0.15, 0.20, 0.30):
-                _cm = (_cash_gross_end - _cash_turnover
-                       * (bk + statutory_pct) / 100.0) / capital - 1
-                _mm = mtf.roe_after_costs(_rows, capital,
-                                          interest_pa=mtf_rate / 100.0,
-                                          pledge=mtf_pledge, brokerage_pct=bk,
-                                          statutory_pct=statutory_pct)
-                _brok_tbl.append(dict(Brokerage_pct_per_side=bk,
-                                      Cash_model_pct=_cm * 100,
-                                      MTF_return_pct=_mm * 100,
-                                      Advantage_pp=(_mm - _cm) * 100))
-            st.markdown("**If the brokerage rate changed**")
-            st.dataframe(pd.DataFrame(_brok_tbl), use_container_width=True,
-                         hide_index=True)
-            st.caption(
-                "Both models pay brokerage on every trade, and the MTF book trades "
-                "about double the value, so brokerage is usually a bigger lever on "
-                "the final answer than the MTF interest rate. Worth checking which "
-                "rate is actually negotiable.")
-
-        # -- monthly -------------------------------------------------------
-        with st.expander("Month by month"):
-            _md = pd.DataFrame([
-                dict(Date=r["Date"], Cash=n["NAV"], Mtf=r["NetAfterCosts"])
-                for r, n in zip(_c, nav_rows)])
-            _md["M"] = pd.to_datetime(_md["Date"]).dt.to_period("M").astype(str)
-            _mrows, _pc, _pm = [], capital, capital
-            for _m, _g in _md.groupby("M", sort=True):
-                _ec, _em = _g["Cash"].iloc[-1], _g["Mtf"].iloc[-1]
-                _mrows.append(dict(Month=_m,
-                                   Cash_model_pct=(_ec / _pc - 1) * 100,
-                                   MTF_pct=(_em / _pm - 1) * 100,
-                                   Difference_pp=((_em / _pm) - (_ec / _pc)) * 100))
-                _pc, _pm = _ec, _em
-            _mdf = pd.DataFrame(_mrows)
-            st.dataframe(_mdf, use_container_width=True, hide_index=True)
-            _up = _mdf[_mdf.Cash_model_pct > 0]
-            _dn = _mdf[_mdf.Cash_model_pct <= 0]
-            st.caption(
-                f"In the {len(_up)} positive months MTF added "
-                f"{_up.Difference_pp.mean():+.2f}pp on average; in the {len(_dn)} "
-                f"flat or negative months it cost {_dn.Difference_pp.mean():+.2f}pp. "
-                f"Interest is charged every calendar day regardless of whether the "
-                f"month worked, so a flat month is a small loss under MTF.")
-
-        # -- accuracy check ------------------------------------------------
-        with st.expander("Accuracy check"):
-            _ok = abs(_audit["gap"]) < 1.0
-            st.dataframe(pd.DataFrame([
-                ("Profit locked in on stocks already sold", _audit["realised"]),
-                ("Profit on stocks still held", _audit["unrealised"]),
-                ("Client money + total profit (what it should be)",
-                 capital + _audit["realised"] + _audit["unrealised"]),
-                ("What the model reports", _rows[-1]["NetWorth"]),
-                ("Difference", _audit["gap"]),
-            ], columns=["Item", "Rupees"]), use_container_width=True,
-                hide_index=True,
-                column_config={"Rupees": st.column_config.NumberColumn(format="%.2f")})
-            if _ok:
-                st.caption(
-                    "Every trade's profit and loss was rebuilt a second, "
-                    "independent way (matching sells against the oldest buys "
-                    "first) and agrees with the model to the rupee.")
-            else:
-                st.markdown(
-                    '<div class="err">The independent recalculation does not '
-                    'agree with the model. Do not use these MTF figures until '
-                    'this is resolved.</div>', unsafe_allow_html=True)
-
-        # -- daily detail --------------------------------------------------
-        with st.expander("Daily detail"):
-            _dd = pd.DataFrame([dict(
-                Date=r["Date"],
-                CashModelNAV=n["NAV"],
-                StockValue=r["GrossAssets"],
-                CashBalance=r["Cash"],
-                BorrowedAmount=r["TotalLeverage"],
-                ClientMoneyValue=r["NetWorth"],
-                StockPerRupee=r["StockPerRupee"],
-                Positions=r["Positions"],
-                CostsToDate=r["AllCosts"],
-                ValueAfterCosts=r["NetAfterCosts"],
-            ) for r, n in zip(_c, nav_rows)])
-            st.dataframe(_dd, use_container_width=True, hide_index=True, height=420)
-            st.download_button(
-                "Download MTF daily detail (CSV)",
-                _dd.to_csv(index=False).encode(),
-                file_name=f"{pname.replace(' ', '_')}_MTF_daily.csv",
-                mime="text/csv")
 
 # -- corporate-action commit helper -------------------------------------------
 
