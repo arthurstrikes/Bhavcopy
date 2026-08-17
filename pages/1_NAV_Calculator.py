@@ -16,6 +16,7 @@ Streamlit 1.39.0 API only - use_container_width, never width=.
 
 import hashlib
 import io
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, timedelta
 
@@ -24,16 +25,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 
 import imp_engine as engine
 import mtf_leverage as mtf
 import nse_bhavcopy
-
-try:
-    from lib import github_io as gio
-except Exception:          # lib/ absent or misconfigured - dropbox source hides
-    gio = None
 
 try:
     import pdf_report
@@ -132,6 +129,29 @@ h1,h2,h3,h4,h5 {{ font-family:'Plus Jakarta Sans','Inter',sans-serif; }}
 .note {{ background:var(--tint8); border-left:3px solid var(--primary);
          padding:12px 14px; border-radius:0 5px 5px 0; font-size:.82rem;
          color:var(--ink); margin-bottom:var(--s2); }}
+/* The detail strip is a keyed st.radio, not st.tabs, so its selection
+   survives a rerun. This CSS restores the tab appearance. */
+div[role="radiogroup"]:has(input[value="Contributors"]) {{
+    gap:1.6rem; border-bottom:1px solid rgba(0,0,0,.10); padding-bottom:0;
+    margin-bottom:var(--s2); flex-wrap:wrap; }}
+div[role="radiogroup"]:has(input[value="Contributors"]) label {{
+    padding:6px 2px 10px; margin:0; border-bottom:2px solid transparent;
+    cursor:pointer; }}
+div[role="radiogroup"]:has(input[value="Contributors"]) label:hover {{
+    border-bottom-color:var(--tint30); }}
+div[role="radiogroup"]:has(input[value="Contributors"]) label > div:first-child {{
+    display:none; }}          /* hide the radio dot */
+div[role="radiogroup"]:has(input[value="Contributors"]) label p {{
+    font-size:.88rem; font-weight:500; color:rgba(0,0,0,.55);
+    margin:0; white-space:nowrap; }}
+div[role="radiogroup"]:has(input[value="Contributors"]) label:has(input:checked) {{
+    border-bottom-color:var(--primary); }}
+div[role="radiogroup"]:has(input[value="Contributors"]) label:has(input:checked) p {{
+    color:var(--primary); font-weight:600; }}
+.nudge {{ display:inline-flex; align-items:center; gap:8px;
+    background:var(--tint8); border:1px solid var(--tint30);
+    border-radius:999px; padding:6px 14px; font-size:.82rem;
+    color:var(--primary); font-weight:600; margin:10px 0 2px; }}
 .warn {{ background:rgba(184,120,0,.08); border-left:3px solid var(--amber);
          padding:12px 14px; border-radius:0 5px 5px 0; font-size:.82rem;
          color:var(--ink); margin-bottom:var(--s2); }}
@@ -247,6 +267,29 @@ def fetch_closes(start: date, end: date):
                 errors[d] = err
             elif m:
                 out[d] = m
+
+    # Retry pass. A network failure on one date is transient far more often
+    # than it is real, and a date that silently drops out of the calendar
+    # changes the NAV without changing anything that looks wrong. Retry only
+    # the failures, serially, with a widening pause - a burst of parallel
+    # retries against a host that just refused us is the wrong move.
+    if errors:
+        for attempt in range(3):
+            if not errors:
+                break
+            pending = sorted(errors)
+            bar.progress(1.0, text=f"Retrying {len(pending)} failed session(s), "
+                                   f"attempt {attempt + 1} of 3")
+            time.sleep(1.5 * (attempt + 1))
+            for d in pending:
+                _d, m, err = one(d)
+                if err:
+                    errors[d] = err
+                else:
+                    errors.pop(d, None)
+                    if m:
+                        out[d] = m
+
     bar.empty()
     return out, errors
 
@@ -532,41 +575,10 @@ with st.sidebar:
                    "with the cash model above, so the two are comparable.")
 
     st.markdown("### Advice log")
-
-    # "From dropbox" appears only when lib/github_io is importable AND the
-    # storage secrets are actually present - a half-configured deployment must
-    # not offer an option that then fails.
-    _dbx_cfg, _dbx_err = None, None
-    if gio is not None:
-        try:
-            _dbx_cfg = gio.cfg(st)
-        except Exception as e:
-            _dbx_err = str(e)
-
-    _sources = ["Upload file", "Paste rows"] + (["From dropbox"] if _dbx_cfg else [])
-    src = st.radio("Source", _sources, horizontal=True,
+    src = st.radio("Source", ["Upload file", "Paste rows"], horizontal=True,
                    label_visibility="collapsed", key="log_src")
-    uploaded, pasted, picked = None, "", None
-    if src == "From dropbox":
-        try:
-            _entries = [f for f in gio.list_files(_dbx_cfg)
-                        if f.get("name", "").lower().endswith((".csv", ".xlsx", ".xls"))]
-        except Exception as e:
-            _entries = []
-            st.error(f"Could not read the dropbox index: {e}")
-        if not _entries:
-            st.caption("No CSV/XLSX files in the dropbox yet. Upload one on the "
-                       "Dropbox page.")
-        else:
-            _labels = [f"{f['name']}  -  {f.get('tag','misc')}, "
-                       f"{f.get('uploaded','')[:10]}" for f in _entries]
-            _i = st.selectbox("Dropbox file", range(len(_entries)),
-                              format_func=lambda i: _labels[i],
-                              label_visibility="collapsed")
-            picked = _entries[_i]
-            if picked.get("description"):
-                st.caption(picked["description"])
-    elif src == "Upload file":
+    uploaded, pasted = None, ""
+    if src == "Upload file":
         uploaded = st.file_uploader("Upload", type=["csv", "xlsx", "xls"],
                                     label_visibility="collapsed",
                                     help="CSV or XLSX. Delimiter and columns "
@@ -583,23 +595,10 @@ with st.sidebar:
     log_source = uploaded
     if src == "Paste rows" and pasted.strip():
         log_source = _PastedLog(pasted.encode("utf-8"))
-    elif src == "From dropbox" and picked is not None:
-        # Downloaded once and cached on the selected file's URL, so switching
-        # sidebar widgets does not re-fetch it on every rerun.
-        @st.cache_data(show_spinner="Fetching from dropbox...")
-        def _dbx_bytes(url):
-            r = requests.get(url, timeout=120)
-            r.raise_for_status()
-            return r.content
-        try:
-            log_source = gio.StoredFile(_dbx_bytes(picked["url"]), picked["name"])
-        except Exception as e:
-            log_source = None
-            st.error(f"Could not download {picked['name']}: {e}")
 
     run_btn = st.button("Calculate NAV", type="primary", use_container_width=True,
                         disabled=log_source is None)
-    st.caption("IMP NAV Calculator v3.2")
+    st.caption("IMP NAV Calculator v3.3")
 
 # -- landing ------------------------------------------------------------------
 
@@ -659,15 +658,7 @@ eq_log = log_df[~log_df["is_liquid"]]
 # a constant for every paste ("pasted_log.csv"), so it can't distinguish two
 # different pastes, and re-hashing a large paste on every widget change is
 # wasted work. Uploads keep the filename; it already changes with the file.
-if src == "Upload file":
-    log_key = uploaded.name
-elif src == "From dropbox":
-    # The stored path is unique per upload (timestamp-prefixed), so it changes
-    # whenever the file does - unlike the bare filename, which would collide
-    # across two different uploads of the same-named log.
-    log_key = picked["path"]
-else:
-    log_key = hashlib.md5(pasted.encode()).hexdigest()
+log_key = uploaded.name if src == "Upload file" else hashlib.md5(pasted.encode()).hexdigest()
 
 params = (log_key, capital, start_override, to_date, gate_pp, force_retarget,
           benchmark, ca_on, ca_mode, ca_method, dm_policy, ca_override_txt,
@@ -706,6 +697,33 @@ if "nav_results" not in st.session_state:
         st.markdown('<div class="err">No NSE sessions retrieved for this range. '
                     'Check the date window and the archive host.</div>',
                     unsafe_allow_html=True)
+        st.stop()
+
+    # HARD GATE - do not compute on a partial calendar.
+    #
+    # run_nav builds its trading calendar from whatever closes came back, so a
+    # failed fetch silently removes that session from the series. The run then
+    # completes, reports a plausible return, and is wrong. This has bitten this
+    # project twice: 186 sessions reported where 193 exist, and a 205-session
+    # window that ran on 35. Both looked fine on screen.
+    #
+    # A failed date is NOT cached, so re-running re-attempts only the failures.
+    if fetch_errors:
+        _miss = sorted(fetch_errors)
+        _rows = pd.DataFrame([dict(Date=d, Reason=fetch_errors[d]) for d in _miss])
+        st.markdown(
+            f'<div class="err"><strong>Calculation stopped - price data is '
+            f'incomplete.</strong><br>{len(_miss)} date(s) in this range could '
+            f'not be retrieved from the NSE archive, after 3 retries. '
+            f'{len(closes)} session(s) were retrieved.<br><br>'
+            f'Running on a partial calendar silently changes the NAV, so no '
+            f'figure is produced. Failed dates are not cached - click '
+            f'<strong>Calculate NAV</strong> again to retry just these. If they '
+            f'keep failing, the archive host is refusing requests and it is '
+            f'worth waiting a few minutes.</div>', unsafe_allow_html=True)
+        st.dataframe(_rows, use_container_width=True, hide_index=True,
+                     height=min(320, 40 + 35 * len(_rows)))
+        st.session_state.pop("nav_run", None)
         st.stop()
     bench = benchmark_series(closes, benchmark, start_override, to_date)
 
@@ -1061,11 +1079,53 @@ with col_s:
     st.dataframe(pd.DataFrame(list(summary.items()), columns=["Metric", "Value"]),
                  use_container_width=True, hide_index=True, height=490)
 
-# -- 2x MTF comparison section ----------------------------------------------------
 
+# -- MTF nudge ----------------------------------------------------------------
+# Sets the strip's session-state key directly. Only possible because the strip
+# is a keyed radio - st.tabs has no addressable state.
 if st.session_state.get("mtf_results"):
-    st.markdown('<div class="sec">Cash model vs 2x MTF</div>',
-                unsafe_allow_html=True)
+    _n1, _n2 = st.columns([3, 1])
+    with _n1:
+        st.markdown('<div class="nudge">2x MTF comparison is ready for this '
+                    'run</div>', unsafe_allow_html=True)
+    with _n2:
+        if st.button("View comparison", use_container_width=True,
+                     key="goto_mtf"):
+            st.session_state["detail_view"] = "Cash vs 2x MTF"
+            st.session_state["_scroll_detail"] = True
+            st.rerun()
+
+# -- detail tabs --------------------------------------------------------------
+
+st.markdown('<div class="sec">Detail</div>', unsafe_allow_html=True)
+# A keyed radio rather than st.tabs. st.tabs keeps its selection in the
+# browser only, so ANY widget rerun (changing the Holdings date, a filter, a
+# download) snapped the user back to the first tab. Radio state lives in
+# session_state and survives the rerun.
+_VIEWS = ["Contributors", "Risk & costs", "Daily NAV", "Holdings on a date",
+          "Holdings matrix", "Trades", "Dividends", "Reconciliation"]
+if st.session_state.get("mtf_results"):
+    _VIEWS.insert(2, "Cash vs 2x MTF")
+if st.session_state.get("detail_view") not in _VIEWS:
+    st.session_state["detail_view"] = _VIEWS[0]
+st.radio("Detail view", _VIEWS, key="detail_view", horizontal=True,
+         label_visibility="collapsed")
+_v = st.session_state["detail_view"]
+st.markdown("<div id='detail-top'></div>", unsafe_allow_html=True)
+if st.session_state.pop("_scroll_detail", False):
+    # Best-effort scroll. Streamlit exposes no scroll API, so this reaches the
+    # parent document from the component iframe. If a browser or a future
+    # Streamlit release blocks it, the try/catch swallows it and the view has
+    # still switched correctly - the user just scrolls manually.
+    components.html(
+        "<script>try{const d=window.parent.document;"
+        "const e=d.getElementById('detail-top');"
+        "if(e){e.scrollIntoView({behavior:'smooth',block:'start'});}}"
+        "catch(err){}</script>", height=0)
+
+# -- Cash vs 2x MTF view ----------------------------------------------------
+
+if _v == "Cash vs 2x MTF":
     _rows, _audit = st.session_state["mtf_results"]
     _c = mtf.apply_costs(_rows, interest_pa=mtf_rate / 100.0,
                          pledge=mtf_pledge, brokerage_pct=brokerage_pct,
@@ -1283,21 +1343,6 @@ if st.session_state.get("mtf_results"):
             _dd.to_csv(index=False).encode(),
             file_name=f"{pname.replace(' ', '_')}_MTF_daily.csv",
             mime="text/csv")
-
-# -- detail tabs --------------------------------------------------------------
-
-st.markdown('<div class="sec">Detail</div>', unsafe_allow_html=True)
-# A keyed radio rather than st.tabs. st.tabs keeps its selection in the
-# browser only, so ANY widget rerun (changing the Holdings date, a filter, a
-# download) snapped the user back to the first tab. Radio state lives in
-# session_state and survives the rerun.
-_VIEWS = ["Contributors", "Risk & costs", "Daily NAV", "Holdings on a date",
-          "Holdings matrix", "Trades", "Dividends", "Reconciliation"]
-if st.session_state.get("detail_view") not in _VIEWS:
-    st.session_state["detail_view"] = _VIEWS[0]
-st.radio("Detail view", _VIEWS, key="detail_view", horizontal=True,
-         label_visibility="collapsed")
-_v = st.session_state["detail_view"]
 
 if _v == "Contributors":
     if len(attrib_df):
