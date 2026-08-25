@@ -25,6 +25,7 @@ import requests
 
 API = "https://api.github.com"
 MANIFEST_PATH = "index.json"
+LATEST_PATH = "latest.json"
 
 # GitHub's Contents API rejects blobs over ~100 MB. 95 MB leaves room for the
 # base64 expansion in the request body.
@@ -177,20 +178,53 @@ def load_manifest(c):
         return _empty_manifest(), sha
 
 
+def _compute_latest(files):
+    """Newest entry per tag, by uploaded timestamp. String comparison is safe
+    here because every timestamp is ISO 8601 UTC, which sorts lexicographically
+    in time order."""
+    latest = {}
+    for f in files:
+        t = f.get("tag", "misc")
+        if t not in latest or f.get("uploaded", "") > latest[t].get("uploaded", ""):
+            latest[t] = f
+    return latest
+
+
 def save_manifest(c, manifest, sha):
     manifest["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     manifest["files"].sort(key=lambda f: f.get("uploaded", ""), reverse=True)
     blob = json.dumps(manifest, indent=2).encode("utf-8")
-    for attempt in (0, 1):
+    # GitHub returns 409 for a concurrent write but 422 for a stale sha, and a
+    # stale sha is the common case here: any earlier write in the same page
+    # session (an upload, a delete) advances the sha while the caller still
+    # holds the one it read at page load. Re-read and retry on both.
+    for attempt in (0, 1, 2):
         try:
             gh_put(c, MANIFEST_PATH, blob, "chore: update manifest", sha)
-            return
+            break
         except requests.HTTPError as e:
             r = getattr(e, "response", None)
-            if r is not None and r.status_code == 409 and attempt == 0:
-                _, sha = load_manifest(c)   # someone else wrote; re-read sha
+            if r is not None and r.status_code in (409, 422) and attempt < 2:
+                _, sha = load_manifest(c)
                 continue
             raise
+    else:
+        return
+
+    # latest.json is written right after a successful manifest commit, from
+    # the same in-memory file list, so the two can only diverge if this second
+    # write itself fails - never from a race with the first. Best-effort: a
+    # failure here must not undo the manifest write or block the caller, since
+    # latest.json is a convenience index, not the registry of record.
+    try:
+        latest_blob = json.dumps({
+            "updated": manifest["updated"],
+            "latest": _compute_latest(manifest["files"]),
+        }, indent=2).encode("utf-8")
+        _, latest_sha = gh_get(c, LATEST_PATH)
+        gh_put(c, LATEST_PATH, latest_blob, "chore: update latest.json", latest_sha)
+    except requests.HTTPError:
+        pass
 
 
 # ------------------------------------------------------------------ helpers
