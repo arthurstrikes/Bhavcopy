@@ -38,6 +38,11 @@ try:
 except Exception:
     PDF_OK = False
 
+try:
+    from lib import github_io as gio
+except Exception:          # lib/ absent or misconfigured - dropbox source hides
+    gio = None
+
 # -- design tokens ------------------------------------------------------------
 # Single source of truth. The theme in .streamlit/config.toml must mirror
 # primary / bg / surface / ink or the Streamlit chrome will not match the cards.
@@ -257,7 +262,14 @@ def fetch_closes(start: date, end: date):
 
     bar = st.progress(0.0, text=f"Fetching NSE sessions 0 / {len(days)}")
     done = 0
-    with ThreadPoolExecutor(max_workers=nse_bhavcopy.MAX_WORKERS) as ex:
+    # Deliberately below nse_bhavcopy.MAX_WORKERS (8). The archive host is a
+    # static file server with no documented rate limit, but it demonstrably
+    # drops connections under 8-way concurrency from Streamlit Cloud - live
+    # retry logs showed 136 of ~205 first-pass failures at 8 workers, with the
+    # identical dates succeeding when retried serially. A slower first pass
+    # that mostly succeeds beats a fast one that fails 65% of dates and has to
+    # be walked back afterward anyway.
+    with ThreadPoolExecutor(max_workers=3) as ex:
         for d, m, err in ex.map(one, days):
             done += 1
             if done % 5 == 0 or done == len(days):
@@ -268,27 +280,34 @@ def fetch_closes(start: date, end: date):
             elif m:
                 out[d] = m
 
-    # Retry pass. A network failure on one date is transient far more often
-    # than it is real, and a date that silently drops out of the calendar
-    # changes the NAV without changing anything that looks wrong. Retry only
-    # the failures, serially, with a widening pause - a burst of parallel
-    # retries against a host that just refused us is the wrong move.
-    if errors:
-        for attempt in range(3):
-            if not errors:
-                break
-            pending = sorted(errors)
-            bar.progress(1.0, text=f"Retrying {len(pending)} failed session(s), "
-                                   f"attempt {attempt + 1} of 3")
-            time.sleep(1.5 * (attempt + 1))
-            for d in pending:
-                _d, m, err = one(d)
-                if err:
-                    errors[d] = err
-                else:
-                    errors.pop(d, None)
-                    if m:
-                        out[d] = m
+    # Retry pass, serially. A network failure on one date is transient far
+    # more often than it is real, and a date that silently drops out of the
+    # calendar changes the NAV without changing anything that looks wrong.
+    # Loop while progress is being made rather than a fixed attempt count -
+    # a pass that is still clearing dates should be allowed to finish; a pass
+    # that clears nothing means the host is refusing outright and further
+    # attempts just waste time. Capped at 8 passes as a backstop.
+    attempt = 0
+    while errors and attempt < 8:
+        attempt += 1
+        pending = sorted(errors)
+        before = len(pending)
+        for i, d in enumerate(pending, 1):
+            if i % 5 == 0 or i == before:
+                bar.progress(min(1.0, i / before),
+                             text=f"Retrying failed sessions serially - "
+                                  f"{i} / {before} (pass {attempt})")
+            _d, m, err = one(d)
+            if err:
+                errors[d] = err
+            else:
+                errors.pop(d, None)
+                if m:
+                    out[d] = m
+        if len(errors) == before:
+            break           # a full pass cleared nothing - stop, let the gate fire
+        if errors:
+            time.sleep(2.0)
 
     bar.empty()
     return out, errors
@@ -575,10 +594,41 @@ with st.sidebar:
                    "with the cash model above, so the two are comparable.")
 
     st.markdown("### Advice log")
-    src = st.radio("Source", ["Upload file", "Paste rows"], horizontal=True,
+
+    # "From dropbox" appears only when lib/github_io is importable AND the
+    # storage secrets are actually present - a half-configured deployment must
+    # not offer an option that then fails.
+    _dbx_cfg, _dbx_err = None, None
+    if gio is not None:
+        try:
+            _dbx_cfg = gio.cfg(st)
+        except Exception as e:
+            _dbx_err = str(e)
+
+    _sources = ["Upload file", "Paste rows"] + (["From dropbox"] if _dbx_cfg else [])
+    src = st.radio("Source", _sources, horizontal=True,
                    label_visibility="collapsed", key="log_src")
-    uploaded, pasted = None, ""
-    if src == "Upload file":
+    uploaded, pasted, picked = None, "", None
+    if src == "From dropbox":
+        try:
+            _entries = [f for f in gio.list_files(_dbx_cfg)
+                        if f.get("name", "").lower().endswith((".csv", ".xlsx", ".xls"))]
+        except Exception as e:
+            _entries = []
+            st.error(f"Could not read the dropbox index: {e}")
+        if not _entries:
+            st.caption("No CSV/XLSX files in the dropbox yet. Upload one on the "
+                       "Dropbox page.")
+        else:
+            _labels = [f"{f['name']}  -  {f.get('tag','misc')}, "
+                       f"{f.get('uploaded','')[:10]}" for f in _entries]
+            _i = st.selectbox("Dropbox file", range(len(_entries)),
+                              format_func=lambda i: _labels[i],
+                              label_visibility="collapsed")
+            picked = _entries[_i]
+            if picked.get("description"):
+                st.caption(picked["description"])
+    elif src == "Upload file":
         uploaded = st.file_uploader("Upload", type=["csv", "xlsx", "xls"],
                                     label_visibility="collapsed",
                                     help="CSV or XLSX. Delimiter and columns "
@@ -595,10 +645,21 @@ with st.sidebar:
     log_source = uploaded
     if src == "Paste rows" and pasted.strip():
         log_source = _PastedLog(pasted.encode("utf-8"))
+    elif src == "From dropbox" and picked is not None:
+        @st.cache_data(show_spinner="Fetching from dropbox...")
+        def _dbx_bytes(url):
+            r = requests.get(url, timeout=120)
+            r.raise_for_status()
+            return r.content
+        try:
+            log_source = gio.StoredFile(_dbx_bytes(picked["url"]), picked["name"])
+        except Exception as e:
+            log_source = None
+            st.error(f"Could not download {picked['name']}: {e}")
 
     run_btn = st.button("Calculate NAV", type="primary", use_container_width=True,
                         disabled=log_source is None)
-    st.caption("IMP NAV Calculator v3.3")
+    st.caption("IMP NAV Calculator v3.5")
 
 # -- landing ------------------------------------------------------------------
 
@@ -658,7 +719,14 @@ eq_log = log_df[~log_df["is_liquid"]]
 # a constant for every paste ("pasted_log.csv"), so it can't distinguish two
 # different pastes, and re-hashing a large paste on every widget change is
 # wasted work. Uploads keep the filename; it already changes with the file.
-log_key = uploaded.name if src == "Upload file" else hashlib.md5(pasted.encode()).hexdigest()
+if src == "Upload file":
+    log_key = uploaded.name
+elif src == "From dropbox":
+    # Timestamp-prefixed storage path, unique per upload - two different
+    # uploads sharing a filename must not collide in the run cache.
+    log_key = picked["path"]
+else:
+    log_key = hashlib.md5(pasted.encode()).hexdigest()
 
 params = (log_key, capital, start_override, to_date, gate_pp, force_retarget,
           benchmark, ca_on, ca_mode, ca_method, dm_policy, ca_override_txt,

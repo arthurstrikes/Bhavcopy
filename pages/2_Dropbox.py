@@ -30,6 +30,10 @@ st.markdown(f"""<style>
 .err {{ background:#FDEDEC; border-left:3px solid #C0392B; padding:.7rem .9rem;
         border-radius:4px; font-size:.9rem; }}
 .fmeta {{ color:{PALETTE['muted']}; font-size:.82rem; }}
+/* Long raw URLs otherwise scroll horizontally and sit under the copy icon. */
+div[data-testid="stCode"] pre, div[data-testid="stCode"] code {{
+    white-space:pre-wrap !important; word-break:break-all !important;
+    overflow-x:hidden !important; padding-right:2.6rem !important; }}
 </style>""", unsafe_allow_html=True)
 
 st.markdown('<div class="rh-title">Dropbox</div>', unsafe_allow_html=True)
@@ -68,14 +72,51 @@ st.markdown("### Upload")
 files = st.file_uploader("Any file type", type=None, accept_multiple_files=True,
                          label_visibility="collapsed", key="dropbox_upload")
 
+# Streamlit's built-in "Limit 200MB per file" text comes from server.maxUploadSize
+# in config.toml, which is global to the app and cannot be overridden per widget.
+# The real ceiling here is GitHub's Contents API limit, so state it explicitly.
+st.caption(f"Ceiling is {gio.human(gio.MAX_BYTES)} per file (GitHub API limit), "
+           f"not the 200MB shown above.")
+
+# Batch defaults. Applied to every file unless overridden per-file below.
 c1, c2 = st.columns([3, 2])
 desc = c1.text_input("Description",
                      placeholder="e.g. MOTF advice log through 31-Jul-2026")
 tag = c2.selectbox("Tag", gio.TAGS, index=gio.TAGS.index("misc"))
 
+# Per-file overrides. Only shown for a batch - for a single file the two fields
+# above already are the per-file fields, and duplicating them adds noise.
+meta = {}
 if files:
+    if len(files) > 1:
+        with st.expander(f"Per-file description and tag ({len(files)} files)"):
+            st.caption("Blank fields fall back to the batch values above.")
+            for f in files:
+                st.markdown(f"**{f.name}**")
+                m1, m2 = st.columns([3, 2])
+                fd = m1.text_input("Description", key=f"d_{f.name}",
+                                   placeholder=desc or "(batch default)",
+                                   label_visibility="collapsed")
+                ft = m2.selectbox("Tag", ["(batch default)"] + gio.TAGS,
+                                  key=f"t_{f.name}", label_visibility="collapsed")
+                meta[f.name] = (fd.strip() or desc,
+                                tag if ft == "(batch default)" else ft)
+
     total = sum(len(f.getvalue()) for f in files)
+    oversize = [f.name for f in files if len(f.getvalue()) > gio.MAX_BYTES]
     st.caption(f"{len(files)} file(s), {gio.human(total)} total")
+    if oversize:
+        st.markdown('<div class="err"><strong>Too large, will be skipped:</strong> '
+                    + ", ".join(oversize) + "</div>", unsafe_allow_html=True)
+
+    # A blank description makes a file hard to identify from the manifest later,
+    # which is the whole point of the manifest - warn rather than block.
+    missing = [f.name for f in files if not (meta.get(f.name, (desc, tag))[0])]
+    if missing:
+        st.markdown('<div class="warn">No description for '
+                    + ", ".join(missing)
+                    + ". These will be harder to identify in the index "
+                      "later.</div>", unsafe_allow_html=True)
 
 if st.button("Upload", type="primary", disabled=not files):
     manifest, msha = gio.load_manifest(C)
@@ -83,8 +124,9 @@ if st.button("Upload", type="primary", disabled=not files):
 
     for i, f in enumerate(files):
         data = f.getvalue()
+        f_desc, f_tag = meta.get(f.name, (desc, tag))
         try:
-            entry = gio.publish(C, data, f.name, tag=tag, description=desc,
+            entry = gio.publish(C, data, f.name, tag=f_tag, description=f_desc,
                                 manifest=manifest, manifest_sha=msha,
                                 commit_manifest=False)
             results.append((f.name, entry["url"], None))
@@ -151,9 +193,14 @@ for f in shown:
                    f'{f.get("uploaded","")[:10]}</div>', unsafe_allow_html=True)
         if f.get("description"):
             a.caption(f["description"])
-        a.code(f.get("url", ""), language=None)
 
-        if b.button("Delete", key=f"del_{f.get('path')}"):
+        delete = b.button("Delete", key=f"del_{f.get('path')}")
+
+        # Full container width, outside the columns - inside the narrow column
+        # the copy icon overlays the URL text and forces a scrollbar.
+        st.code(f.get("url", ""), language=None)
+
+        if delete:
             try:
                 gio.remove(C, f, manifest, msha)
                 st.rerun()
